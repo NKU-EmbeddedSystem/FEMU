@@ -1,0 +1,599 @@
+/*
+ * Cylon PNM engine — ANNS (HNSW) offload engine thread for CXLSSD.
+ *
+ * Plain QEMU thread (no BQL), same discipline as the FTL thread. Consumes
+ * jobs from a mailbox at the tail of the CXL window (pnm_uapi.h). The bound
+ * index blob is copied once at BIND into engine-local memory (read-only,
+ * race-free); query/result/mailbox accesses go through cache-aware xlate
+ * (hit -> pmem cache slice, miss -> logical_space), the same locations the
+ * guest's hardware path uses, so results are coherent with the guest view.
+ *
+ * Phase A: correctness. Real HNSW traversal on real data, no timing model.
+ * Phase B (later): bandwidth/compute token-bucket timing injection.
+ */
+#include "../nvme.h"
+#include "../ftl/ftl.h"
+#include "cxlssd.h"
+#include "pnm_uapi.h"
+#include "der_kvm.h"
+#include "cache/cache.h"
+#include "qemu/thread.h"
+#include "qemu/timer.h"
+
+/* ---------------- fp16 -> fp32 (software, exact) ---------------- */
+static inline float pnm_f16_to_f32(uint16_t h)
+{
+    union { uint32_t u; float f; } cvt;
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t man = h & 0x03ffu;
+
+    if (exp == 0) {
+        if (man == 0) {
+            cvt.u = sign;
+        } else {
+            /* subnormal: value = man * 2^-24; renormalize */
+            int b = 10;
+            while (!((man >> b) & 1u)) {
+                b--;
+            }
+            cvt.u = sign | ((uint32_t)(b + 103) << 23) |
+                    ((man - (1u << b)) << (23 - b));
+        }
+    } else if (exp == 31) {
+        cvt.u = sign | (0xffu << 23) | (man << 13);
+    } else {
+        cvt.u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+    }
+    return cvt.f;
+}
+
+/* ---------------- binary heaps over {float,u32} ---------------- */
+struct pnm_cnd {
+    float d;
+    uint32_t id;
+};
+
+static inline void heap_swap(struct pnm_cnd *a, uint32_t i, uint32_t j)
+{
+    struct pnm_cnd t = a[i];
+    a[i] = a[j];
+    a[j] = t;
+}
+
+/* min-heap by d (candidate heap) */
+static void heap_push_min(struct pnm_cnd *h, uint32_t *n, uint32_t cap,
+                          float d, uint32_t id)
+{
+    if (*n >= cap) {
+        return;
+    }
+    uint32_t i = (*n)++;
+    h[i].d = d;
+    h[i].id = id;
+    while (i && h[(i - 1) / 2].d > h[i].d) {
+        heap_swap(h, (i - 1) / 2, i);
+        i = (i - 1) / 2;
+    }
+}
+
+static struct pnm_cnd heap_pop_min(struct pnm_cnd *h, uint32_t *n)
+{
+    struct pnm_cnd top = h[0];
+    (*n)--;
+    h[0] = h[*n];
+    uint32_t i = 0;
+    while (1) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < *n && h[l].d < h[m].d) {
+            m = l;
+        }
+        if (r < *n && h[r].d < h[m].d) {
+            m = r;
+        }
+        if (m == i) {
+            break;
+        }
+        heap_swap(h, i, m);
+        i = m;
+    }
+    return top;
+}
+
+/* max-heap by d (result heap: root = worst of the best) */
+static void heap_push_max(struct pnm_cnd *h, uint32_t *n, uint32_t cap,
+                          float d, uint32_t id)
+{
+    if (*n >= cap) {
+        return;
+    }
+    uint32_t i = (*n)++;
+    h[i].d = d;
+    h[i].id = id;
+    while (i && h[(i - 1) / 2].d < h[i].d) {
+        heap_swap(h, (i - 1) / 2, i);
+        i = (i - 1) / 2;
+    }
+}
+
+static struct pnm_cnd heap_pop_max(struct pnm_cnd *h, uint32_t *n)
+{
+    struct pnm_cnd top = h[0];
+    (*n)--;
+    h[0] = h[*n];
+    uint32_t i = 0;
+    while (1) {
+        uint32_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < *n && h[l].d > h[m].d) {
+            m = l;
+        }
+        if (r < *n && h[r].d > h[m].d) {
+            m = r;
+        }
+        if (m == i) {
+            break;
+        }
+        heap_swap(h, i, m);
+        i = m;
+    }
+    return top;
+}
+
+/* ---------------- PNM engine state ---------------- */
+struct pnm_state {
+    Cxlssd *ctx;
+    FemuCtrl *n;
+    volatile int stop;
+    QemuThread thread;
+    bool started;
+
+    /* bound CYH1 index metadata */
+    bool bound;
+    uint64_t idx_base;
+    uint32_t dim, count, maxm0;
+    uint32_t entry_point;
+    uint8_t entry_level;
+    uint64_t g_off_vectors, g_off_adj0, g_off_upper, g_off_levels;
+
+    /* engine-local graph copy (copied from window at BIND) */
+    uint8_t *graph;
+
+    /* per-job scratch (allocated at BIND) */
+    uint8_t *visited;            /* bitset, count bits */
+    struct pnm_cnd *cand;        /* candidate min-heap, 64K entries */
+    struct pnm_cnd *res;         /* result max-heap, cap 4K */
+    uint32_t cand_cap, res_cap;
+    float *qconv;                /* query converted to fp32, [dim] */
+
+    /* stats of the last completed job (copied into the mailbox resp) */
+    uint64_t job_ns, job_dist, job_hops, job_pages;
+    uint32_t job_found;
+};
+
+/* cache-aware translation: hit -> pmem cache slice, miss -> logical_space */
+static void *pnm_xlate(Cxlssd *ctx, FemuCtrl *n, uint64_t off)
+{
+    if (ctx->cache) {
+        /* locked, by-value slot lookup: safe against concurrent FTL-thread
+         * inserts/evictions (GTree is not thread-safe, and a returned
+         * CacheEntry* could be freed by an eviction) */
+        uint32_t slot = cylon_cache_lookup_slot(ctx->cache->cache_data,
+                                                off >> 12);
+        if (slot != UINT32_MAX) {
+            return (char *)ctx->cache_backend.buf_space +
+                   (size_t)slot * CACHE_PAGE_SIZE + (off & 0xfff);
+        }
+    }
+    return (char *)n->mbe->logical_space + off;
+}
+
+/* xlate-aware reader (handles 4K straddling) */
+static void pnm_read(Cxlssd *ctx, FemuCtrl *n, uint64_t off, void *dst, uint32_t len)
+{
+    uint8_t *d = dst;
+    while (len) {
+        uint32_t in_page = 4096 - (off & 0xfff);
+        uint32_t take = len < in_page ? len : in_page;
+        memcpy(d, pnm_xlate(ctx, n, off), take);
+        d += take;
+        off += take;
+        len -= take;
+    }
+}
+
+/* xlate-aware writer */
+static void pnm_write(Cxlssd *ctx, FemuCtrl *n, uint64_t off, const void *src, uint32_t len)
+{
+    const uint8_t *s = src;
+    while (len) {
+        uint32_t in_page = 4096 - (off & 0xfff);
+        uint32_t take = len < in_page ? len : in_page;
+        memcpy(pnm_xlate(ctx, n, off), s, take);
+        s += take;
+        off += take;
+        len -= take;
+    }
+}
+
+/* drop any previously bound index (re-BIND or shutdown) */
+static void pnm_unbind(struct pnm_state *st)
+{
+    g_free(st->graph);
+    g_free(st->visited);
+    st->graph = NULL;
+    st->visited = NULL;
+    st->bound = false;
+}
+
+/* ---------------- job handlers ---------------- */
+
+static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
+{
+    Cxlssd *ctx = st->ctx;
+    FemuCtrl *n = st->n;
+    pnm_unbind(st);
+    struct cyh1_header hdr;
+    uint64_t win_sz = (uint64_t)n->mbe->size;
+    uint64_t blob_sz;
+
+    pnm_read(ctx, n, a0, &hdr, sizeof(hdr));
+
+    if (hdr.magic != CYH1_MAGIC || hdr.version != CYH1_VERSION) {
+        femu_log("Cylon PNM: BIND bad magic/version (0x%08x/%u)\n",
+                 hdr.magic, hdr.version);
+        return PNM_ST_EINVAL;
+    }
+    if (!hdr.count || hdr.count > (1u << 26) || !hdr.dim || hdr.dim > 4096) {
+        femu_log("Cylon PNM: BIND bad count/dim (%u/%u)\n", hdr.count, hdr.dim);
+        return PNM_ST_EINVAL;
+    }
+    if (hdr.maxm0 > 128) {
+        return PNM_ST_EINVAL;
+    }
+
+    blob_sz = hdr.off_levels + hdr.count;   /* levels array is the last section */
+    if (a0 + blob_sz > win_sz - PNM_MB_OFF_FROM_END) {
+        femu_log("Cylon P engine: BIND blob overflows window (blob_end %" PRIu64
+                 " > limit %" PRIu64 ")\n", a0 + blob_sz,
+                 win_sz - PNM_MB_OFF_FROM_END);
+        return PNM_ST_EINVAL;
+    }
+
+    /* engine-local copy of the whole blob (read-only, race-free) */
+    uint8_t *graph = g_malloc0(blob_sz);
+    if (!graph) {
+        return PNM_ST_ENOMEM;
+    }
+    for (uint64_t i = 0; i < blob_sz; i += 4096) {
+        uint32_t chunk = blob_sz - i > 4096 ? 4096 : (uint32_t)(blob_sz - i);
+        pnm_read(ctx, n, a0 + i, graph + i, chunk);
+    }
+    st->graph = graph;
+
+    st->dim = hdr.dim;
+    st->count = hdr.count;
+    st->maxm0 = hdr.maxm0;
+    st->entry_point = hdr.entry_point;
+    st->entry_level = (uint8_t)hdr.entry_level;
+    st->g_off_vectors = hdr.off_vectors;
+    st->g_off_adj0 = hdr.off_adj0;
+    st->g_off_upper = hdr.off_upper;
+    st->g_off_levels = hdr.off_levels;
+    /* visited must be sized from *this* bind's count (the stale-count alloc
+     * used to hand search a 0-byte buffer -> memset NULL -> SIGSEGV) */
+    st->visited = g_malloc0((st->count + 7) / 8);
+    st->bound = true;
+
+    femu_log("Cylon PNM: index bound (dim %u count %u maxm0 %u blob %" PRIu64 " MB)\n",
+             st->dim, st->count, st->maxm0, blob_sz >> 20);
+    return PNM_ST_OK;
+}
+
+/* ---------------- HNSW traversal ---------------- */
+
+/* L2^2 distance of query (st->qconv) vs vector id (local graph copy) */
+static inline float pnm_dist(struct pnm_state *st, uint32_t id)
+{
+    const uint16_t *v = (const uint16_t *)(st->graph + st->g_off_vectors) +
+                        (size_t)id * st->dim;
+    const float *q = st->qconv;
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < st->dim; i++) {
+        float diff = q[i] - pnm_f16_to_f32(v[i]);
+        acc += diff * diff;
+    }
+    return acc;
+}
+
+/* neighbors at a level: 0 -> adj0 fixed stride; >=1 -> upper records */
+static uint32_t pnm_neighbors(struct pnm_state *st, uint32_t id, int level,
+                              const uint32_t **ids)
+{
+    if (level == 0) {
+        const uint32_t *a = (const uint32_t *)(st->graph + st->g_off_adj0) +
+                            (size_t)id * st->maxm0;
+        *ids = a;
+        uint32_t degree = 0;
+        while (degree < st->maxm0 && a[degree] != 0xffffffffu) {
+            degree++;
+        }
+        return degree;
+    }
+    uint32_t off = ((const uint32_t *)(st->graph + st->g_off_upper))[id];
+    if (!off) {
+        *ids = NULL;
+        return 0;
+    }
+    /* record offsets are relative to the upper section start (the offset
+     * table itself); 0 = element has no upper levels */
+    const uint8_t *r = (const uint8_t *)st->graph + st->g_off_upper + off;
+    for (int l = 1; l < level; l++) {
+        uint32_t d = *(const uint32_t *)r;
+        (void)d;
+        r += 4 + d * 4;
+    }
+    *ids = (const uint32_t *)(r + 4);
+    return *(const uint32_t *)r;
+}
+
+/* level-0 visit: mark visited, push into candidate + result heaps */
+static bool pnm_visit(struct pnm_state *st, uint32_t *cand_n, uint32_t *res_n,
+                      uint32_t id, float d, uint32_t ef)
+{
+    if (st->visited[id >> 3] & (1u << (id & 7))) {
+        return false;
+    }
+    st->visited[id >> 3] |= 1u << (id & 7);
+
+    if (*res_n < ef) {
+        heap_push_max(st->res, res_n, st->res_cap, d, id);
+    } else if (d < st->res[0].d) {
+        heap_pop_max(st->res, res_n);
+        heap_push_max(st->res, res_n, st->res_cap, d, id);
+    } else {
+        return false;
+    }
+    heap_push_min(st->cand, cand_n, st->cand_cap, d, id);
+    return true;
+}
+
+static int pnm_cmp_asc(const void *a, const void *b)
+{
+    float da = ((const struct pnm_cnd *)a)->d;
+    float db = ((const struct pnm_cnd *)b)->d;
+    return da < db ? -1 : (da > db ? 1 : 0);
+}
+
+static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
+                             uint64_t a0, uint64_t a1, uint32_t k, uint32_t ef)
+{
+    Cxlssd *ctx = st->ctx;
+    FemuCtrl *n = st->n;
+    uint64_t win_sz = (uint64_t)n->mbe->size;
+
+    if (!st->bound) {
+        return PNM_ST_ENOINDEX;
+    }
+    if (!k || k > st->res_cap || ef < k || ef > 4096) {
+        return PNM_ST_EINVAL;
+    }
+    if (a0 + (uint64_t)st->dim * 2 > win_sz ||
+        a1 + (uint64_t)k * 8 + 4 > win_sz) {
+        return PNM_ST_EINVAL;
+    }
+
+    /* load + convert query */
+    {
+        uint16_t qh[4096] = {0};
+        pnm_read(ctx, n, a0, qh, st->dim * 2);
+        for (uint32_t i = 0; i < st->dim; i++) {
+            st->qconv[i] = pnm_f16_to_f32(qh[i]);
+        }
+    }
+
+    uint64_t n_dist = 1, n_hops = 0;    /* entry-point distance counted */
+    uint64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* greedy descent through upper levels (entry -> level 1) */
+    uint32_t cur = st->entry_point;
+    float cur_d = pnm_dist(st, cur);
+    for (int l = st->entry_level; l >= 1; l--) {
+        bool improved = true;
+        while (improved) {
+            improved = false;
+            const uint32_t *ids;
+            uint32_t degree = pnm_neighbors(st, cur, l, &ids);
+            n_hops++;
+            for (uint32_t j = 0; j < degree; j++) {
+                uint32_t nb = ids[j];
+                float d = pnm_dist(st, nb);
+                n_dist++;
+                if (d < cur_d) {
+                    cur_d = d;
+                    cur = nb;
+                    improved = true;
+                }
+            }
+        }
+    }
+
+    /* level-0 ef-search */
+    uint32_t cand_n = 0, res_n = 0;
+    memset(st->visited, 0, (st->count + 7) / 8);
+
+    pnm_visit(st, &cand_n, &res_n, cur, cur_d, ef);
+
+    while (cand_n) {
+        struct pnm_cnd c = heap_pop_min(st->cand, &cand_n);
+        if (res_n == ef && c.d > st->res[0].d) {
+            break;
+        }
+        const uint32_t *ids;
+        uint32_t degree = pnm_neighbors(st, c.id, 0, &ids);
+        n_hops++;
+        for (uint32_t j = 0; j < degree; j++) {
+            uint32_t nb = ids[j];
+            float d = pnm_dist(st, nb);
+            n_dist++;
+            pnm_visit(st, &cand_n, &res_n, nb, d, ef);
+        }
+    }
+
+    uint64_t t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    st->job_ns = t1 - t0;
+    st->job_dist = n_dist;
+    st->job_hops = n_hops;
+
+    /* top-k: sort ascending by distance, emit k entries {u32 id, f32 dist} */
+    uint32_t m = res_n < k ? res_n : k;
+    qsort(st->res, res_n, sizeof(struct pnm_cnd), pnm_cmp_asc);
+    for (uint32_t i = 0; i < k; i++) {
+        uint32_t id = i < m ? st->res[i].id : 0xffffffffu;
+        float d = i < m ? st->res[i].d : 0.0f;
+        pnm_write(ctx, n, a1 + (uint64_t)i * 8, &id, 4);
+        pnm_write(ctx, n, a1 + (uint64_t)i * 8 + 4, &d, 4);
+    }
+    pnm_write(ctx, n, a1 + (uint64_t)k * 8, &m, 4);
+
+    st->job_found = m;
+    femu_log("Cylon PNM: search job %u k=%u ef=%u -> %u found (%" PRIu64
+             " ns, dist %" PRIu64 ", hops %" PRIu64 ")\n",
+             job_id, k, ef, m, st->job_ns, n_dist, n_hops);
+    return PNM_ST_OK;
+}
+
+/* ---------------- mailbox polling thread ---------------- */
+
+static void *pnm_thread_fn(void *opaque)
+{
+    struct pnm_state *st = opaque;
+    Cxlssd *ctx = st->ctx;
+    FemuCtrl *n = st->n;
+    const uint64_t mb_off = (uint64_t)n->mbe->size - PNM_MB_OFF_FROM_END;
+
+    femu_log("Cylon PNM: engine up (mailbox at window_end-0x%" PRIx64 ")\n",
+             (uint64_t)PNM_MB_OFF_FROM_END);
+
+    while (!st->stop) {
+        /* status sits at a higher offset than the job fields, so copying the
+         * whole mailbox in one ascending pass can observe a fresh PENDING
+         * with stale job fields (the field loads execute before the writer's
+         * field stores become globally visible). Read the flag FIRST, then
+         * the payload: on x86 the later field loads are then guaranteed to
+         * see the stores that became visible before PENDING (TSO keeps store
+         * order). Without this, ~1% of jobs run the previous job's a0. */
+        uint32_t status;
+        pnm_read(ctx, n, mb_off + offsetof(struct pnm_mb_s, status),
+                 &status, sizeof(status));
+        {
+            static unsigned dbg_n;
+            dbg_n++;
+            if (femu_cxldbg_on() && (dbg_n <= 16 || (dbg_n % 262144) == 0)) {
+                const char *lraw = (const char *)n->mbe->logical_space + mb_off;
+                uint64_t *e4k = der_kvm_get_eptep_dbg(ctx, 12582911);
+                uint64_t *e2m = der_kvm_get_eptep_dbg(ctx, 12321279);
+                fprintf(stderr,
+                        "CXLDBG PNM poll #%u status=%u log=%02x%02x%02x%02x %02x%02x%02x%02x e4k=%016" PRIx64 " e2m=%016" PRIx64 "\n",
+                        dbg_n, status,
+                        lraw[0], lraw[1], lraw[2], lraw[3],
+                        lraw[4], lraw[5], lraw[6], lraw[7],
+                        e4k ? (uint64_t)*e4k : (uint64_t)0,
+                        e2m ? (uint64_t)*e2m : (uint64_t)0);
+            }
+        }
+        if (status != PNM_MB_PENDING) {
+            g_usleep(50);
+            continue;
+        }
+        struct pnm_mb_s mb;
+        pnm_read(ctx, n, mb_off, &mb, sizeof(mb));
+        if (mb.status != PNM_MB_PENDING) {
+            g_usleep(50);
+            continue;
+        }
+
+        /* defaults; SEARCH overrides */
+        st->job_found = 0;
+        st->job_ns = 0;
+        st->job_dist = 0;
+        st->job_hops = 0;
+        st->job_pages = 0;
+
+        int rc;
+        switch (mb.job.op) {
+        case PNM_OP_NOP:
+            rc = PNM_ST_OK;
+            break;
+        case PNM_OP_BIND_INDEX:
+            rc = pnm_handle_bind(st, mb.job.a0);
+            femu_log("Cylon PNM: BIND job %u -> %d\n", mb.job.job_id, rc);
+            break;
+        case PNM_OP_ANNS_SEARCH:
+            rc = pnm_handle_search(st, mb.job.job_id, mb.job.a0, mb.job.a1,
+                                   mb.job.k, mb.job.ef);
+            break;
+        default:
+            femu_log("Cylon PNM: job %u unknown op %u\n", mb.job.job_id,
+                     mb.job.op);
+            rc = PNM_ST_ENOSYS;
+            break;
+        }
+
+        mb.resp.job_id = mb.job.job_id;
+        mb.resp.status = (uint32_t)rc;
+        mb.resp.n_found = st->job_found;
+        mb.resp.reserved = 0;
+        mb.resp.total_ns = st->job_ns;
+        mb.resp.n_dist = st->job_dist;
+        mb.resp.n_hops = st->job_hops;
+        mb.resp.n_pages = st->job_pages;
+
+        pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, resp),
+                  &mb.resp, sizeof(mb.resp));
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        uint32_t done = PNM_MB_DONE;
+        pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, status),
+                  &done, sizeof(done));
+    }
+    return NULL;
+}
+
+/* ---------------- lifecycle ---------------- */
+
+void pnm_start(Cxlssd *ctx, struct FemuCtrl *n)
+{
+    struct pnm_state *st = g_malloc0(sizeof(*st));
+
+    st->ctx = ctx;
+    st->n = n;
+    st->cand_cap = 65536;
+    st->res_cap = 4096;
+    st->cand = g_malloc0(sizeof(struct pnm_cnd) * (size_t)st->cand_cap);
+    st->res = g_malloc0(sizeof(struct pnm_cnd) * (size_t)st->res_cap);
+    st->qconv = g_malloc0(sizeof(float) * 4096);
+    ctx->pnm = st;
+
+    qemu_thread_create(&st->thread, "cylon-pnm", pnm_thread_fn, st,
+                       QEMU_THREAD_JOINABLE);
+    st->started = true;
+    femu_log("Cylon PNM: engine started\n");
+}
+
+void pnm_stop(Cxlssd *ctx)
+{
+    struct pnm_state *st = ctx->pnm;
+
+    if (!st) {
+        return;
+    }
+    ctx->pnm = NULL;
+    if (st->started) {
+        st->stop = 1;
+        qemu_thread_join(&st->thread);
+    }
+    pnm_unbind(st);
+    g_free(st->cand);
+    g_free(st->res);
+    g_free(st->qconv);
+    g_free(st);
+}

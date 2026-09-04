@@ -19,6 +19,19 @@
 #include "hw/femu/timing-model/timing.h"
 #include <immintrin.h>
 
+/* CXL-SSD DER bring-up probes (CXLDBG ...): self-limited stderr prints
+ * scattered in hw/femu/cylon and hw/cxl/cxl-host.c. Silent unless
+ * FEMU_CXLDBG=1 in the environment (mirrors FEMU_DER_VERBOSE). */
+extern int femu_cxldbg;
+static inline int femu_cxldbg_on(void)
+{
+    if (femu_cxldbg < 0) {
+        const char *s = getenv("FEMU_CXLDBG");
+        femu_cxldbg = (s && *s && *s != '0') ? 1 : 0;
+    }
+    return femu_cxldbg;
+}
+
 #define NVME_ID_NS_LBADS(ns)                                                  \
     ((ns)->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX((ns)->id_ns.flbas)].lbads)
 

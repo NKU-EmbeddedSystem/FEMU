@@ -9,6 +9,9 @@
 #include "sysemu/hostmem.h"
 #include <inttypes.h>
 
+/* CXLDBG probe gate (see femu.h) */
+int femu_cxldbg = -1;
+
 static void cxlssd_set_cache_plugin(struct ssd *ssd, struct cache_plugin *plugin)
 {
     Cxlssd *ctx = (Cxlssd *)ssd->opaque;
@@ -72,6 +75,10 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
     cxlssd_init_ctrl_str(n);
 
     ssd->dataplane_started_ptr = &n->dataplane_started;
+    /* CXLSSD mode has no NVMe controller; nothing will ever issue the
+     * admin command that sets dataplane_started. Start the FTL thread
+     * immediately instead of letting it wait forever (livelock). */
+    n->dataplane_started = true;
     ssd->ssdname = (char *)n->devname;
     ssd->opaque = NULL;
     ssd->set_cache_plugin = cxlssd_set_cache_plugin;
@@ -160,13 +167,32 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
         }
     }
 
-    ctx->der_kvm = g_malloc0(sizeof(DerKvmState));
-    if (der_kvm_set_user_memory_region(n) != 0) {
-        femu_err("Cylon DER-KVM: der_kvm_set_user_memory_region failed\n");
-        abort();
+    if (access("/tmp/femu-der-disable", F_OK) == 0) {
+        /* DER off, but still map the window as a plain RAM memslot so
+         * guest accesses are EPT-direct (zero exits) into logical_space.
+         * Sustained per-store MMIO exits through the cfmws IO path wedge
+         * the vCPU on this stack; direct mapping sidesteps that entirely
+         * and keeps guest/engine coherent via logical_space. */
+        ctx->der_kvm = g_malloc0(sizeof(DerKvmState));
+        if (der_kvm_set_user_memory_region_plain(n) != 0) {
+            femu_err("Cylon DER-KVM: plain memslot registration failed; "
+                     "window stays IO-trapped (expect slowness/wedges)\n");
+            g_free(ctx->der_kvm);
+            ctx->der_kvm = NULL;
+        } else {
+            femu_log("Cylon DER-KVM: DER disabled via /tmp/femu-der-disable; "
+                     "window mapped as plain RAM (acceptance mode)\n");
+        }
     } else {
-        femu_log("Cylon DER-KVM: memslot and EPT initialized (base_gpa 0x%" PRIx64 ", size %" PRId64 ")\n",
-                 n->base_gpa, n->mbe ? n->mbe->size : 0);
+        ctx->der_kvm = g_malloc0(sizeof(DerKvmState));
+        if (der_kvm_set_user_memory_region(n) != 0) {
+            femu_err("Cylon DER-KVM: der_kvm_set_user_memory_region failed\n");
+            abort();
+        } else {
+            femu_log("Cylon DER-KVM: memslot and EPT initialized (base_gpa 0x%"
+                     PRIx64 ", size %" PRId64 ")\n",
+                     n->base_gpa, n->mbe ? n->mbe->size : 0);
+        }
     }
 
     ssd_init(n);
@@ -183,6 +209,7 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
     } else {
         femu_log("Cylon CXL-SSD init: cache plugin disabled (bufsz=%u rep=%u)\n", n->bufsz, n->rep);
     }
+    pnm_start(ctx, n);
     femu_log("Cylon CXL-SSD init: complete\n");
 }
 
@@ -191,6 +218,7 @@ static void cxlssd_exit(FemuCtrl *n)
     Cxlssd *ctx = cxlssd_ctx_from_ctrl(n);
     if (ctx) {
         femu_log("Cylon CXL-SSD exit: tearing down\n");
+        pnm_stop(ctx);
         if (ctx->cache) {
             cylon_cache_plugin_destroy(ctx->cache);
             ctx->cache = NULL;
@@ -360,6 +388,14 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
 {
     FemuCtrl *n = (FemuCtrl *)opaque;
     assert(addr < n->mbe->size);
+    {
+        static unsigned dbg_n;
+        if (femu_cxldbg_on() && dbg_n < 64) {
+            dbg_n++;
+            fprintf(stderr, "CXLDBG SSD R dma addr=0x%" PRIx64 " sz=%u skip_ftl=%d\n",
+                    addr, size, n->cxl_skip_ftl);
+        }
+    }
 
     if (n->cxl_skip_ftl) {
         memcpy(data, (const char *)n->mbe->logical_space + addr, size);
@@ -373,6 +409,14 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 {
     FemuCtrl *n = (FemuCtrl *)opaque;
     assert(addr < n->mbe->size);
+    {
+        static unsigned dbg_n;
+        if (femu_cxldbg_on() && dbg_n < 64) {
+            dbg_n++;
+            fprintf(stderr, "CXLDBG SSD W dma addr=0x%" PRIx64 " sz=%u data=0x%" PRIx64 " skip_ftl=%d\n",
+                    addr, size, data, n->cxl_skip_ftl);
+        }
+    }
 
     if (n->cxl_skip_ftl) {
         memcpy((char *)n->mbe->logical_space + addr, &data, size);

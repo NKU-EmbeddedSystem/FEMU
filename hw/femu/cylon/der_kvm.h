@@ -41,6 +41,7 @@ struct kvm_memslot_get_linear_ept {
 typedef struct DerKvmState {
     struct kvm_memslot_get_linear_ept ept;
     bool init_done;
+    bool plain;              /* plain RAM memslot, no DUAL_MODE/linear EPT */
     void *userspace_addr;
     uint64_t memory_size;
     uint64_t guest_phys_addr;
@@ -52,8 +53,12 @@ typedef struct DerKvmState {
 
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn);
 int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa);
+uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn);
 
 int der_kvm_set_user_memory_region(const FemuCtrl *n);
+/* Acceptance/debug mode: register the window as a plain RAM memslot (EPT
+ * direct, zero exits). Guest stores go straight into logical_space. */
+int der_kvm_set_user_memory_region_plain(const FemuCtrl *n);
 int der_kvm_del_user_memory_region(const FemuCtrl *n);
 
 #endif

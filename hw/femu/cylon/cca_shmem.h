@@ -5,7 +5,7 @@
 #ifndef FEMU_CYLON_CCA_SHMEM_H
 #define FEMU_CYLON_CCA_SHMEM_H
 
-#include "qemu/osdep.h"
+#include <stdint.h>
 
 #define CCA_SHMEM_MAGIC  0x43434131
 #define CCA_LAYOUT_VERSION  1

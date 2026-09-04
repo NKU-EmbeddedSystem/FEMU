@@ -2,6 +2,7 @@
 #include "cache/cache_backend.h"
 #include "hw/core/cpu.h"
 #include "sysemu/kvm.h"
+#include "hw/femu/femu.h"     /* femu_cxldbg_on() */
 /* kvm.h declares kvm_vm_ioctl only inside #ifdef NEED_CPU_H; provide it when building without */
 #ifndef NEED_CPU_H
 extern int kvm_vm_ioctl(KVMState *s, int type, ...);
@@ -16,9 +17,14 @@ extern int kvm_vm_ioctl(KVMState *s, int type, ...);
 #define DIRECT_MASK  0x600000000000977ULL
 #define MMIO_MASK    0x0000000586ULL
 
+/* EPT chunk index for an lpn. Chunks are MAX_CONT_ALLOC_SZ (4MB) = 524288
+ * entries, so chunk = lpn >> 19. (A previous (lpn*8)>>20 = lpn>>17 was 4x
+ * too large: every page above 512MB of window indexed past its chunk and
+ * get_eptep() returned NULL, so mailbox/result pages at the 48G tail could
+ * never be flipped to direct EPTEs.) */
 static inline u64 get_leaf_ept_idx(u64 lpn)
 {
-    return (lpn * sizeof(u64 *)) >> (MAX_ORDER + PAGE_SHIFT);
+    return lpn >> (MAX_ORDER + PAGE_SHIFT - 3);
 }
 
 /* Allocate and fetch linear EPT (full CXL_SSD space). */
@@ -37,6 +43,9 @@ static int init_leaf_ept(DerKvmState *s)
             perror("der_kvm: mmap ept failed");
             abort();
         }
+        /* first lpn covered by this chunk, in units of 512 lpns
+         * (4MB chunk / 8B per entry = 524288 lpns = 1024 * 512) */
+        s->ept.ept_list[idx].offset = (u64)idx * 1024;
         size -= sz;
         idx++;
     }
@@ -60,8 +69,24 @@ static u64 *get_eptep(DerKvmState *s, u64 lpn)
         return NULL;
     }
     u64 idx = get_leaf_ept_idx(lpn);
+    if (idx >= 60 || !s->ept.ept_list[idx].ept) {
+        return NULL;
+    }
     u64 off = lpn - (u64)s->ept.ept_list[idx].offset * 512;
+    if (off >= 524288) {
+        return NULL;
+    }
     return s->ept.ept_list[idx].ept + off;
+}
+
+/* debug: expose leaf-entry pointer for live dumping (NULL in plain mode) */
+uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn)
+{
+    DerKvmState *s = ctx ? ctx->der_kvm : NULL;
+    if (!s || !s->init_done || s->plain) {
+        return NULL;
+    }
+    return (uint64_t *)get_eptep(s, lpn);
 }
 
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
@@ -70,12 +95,31 @@ int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
     if (!s) {
         return -1;
     }
+    if (s->plain) {
+        return 0;   /* no per-page EPTE control in plain mode */
+    }
     uint64_t gfn = (s->guest_phys_addr >> PAGE_SHIFT) + lpn;
     u64 *eptep = get_eptep(s, lpn);
     if (eptep) {
+        {
+            static unsigned dbg_n;
+            if (femu_cxldbg_on() && dbg_n < 64) {
+                dbg_n++;
+                fprintf(stderr, "CXLDBG TRAP lpn=%lld eptep=%p old=0x%" PRIx64 "\n",
+                        (long long)lpn, (void *)eptep, (uint64_t)*eptep);
+            }
+        }
         *eptep = (gfn << PAGE_SHIFT) | MMIO_MASK;
-        fprintf(stderr, "Cylon DER-KVM: set trap EPTE for page %lld (gfn 0x%llx)\n",
-                (long long)lpn, (long long)gfn);
+        {
+            static int verbose = -1;
+            if (verbose < 0) {
+                verbose = getenv("FEMU_DER_VERBOSE") ? 1 : 0;
+            }
+            if (verbose) {
+                fprintf(stderr, "Cylon DER-KVM: set trap EPTE for page %lld (gfn 0x%llx)\n",
+                        (long long)lpn, (long long)gfn);
+            }
+        }
         return 0;
     }
     return -1;
@@ -84,11 +128,33 @@ int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
 int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa)
 {
     DerKvmState *s = ctx ? ctx->der_kvm : NULL;
-    u64 *eptep = s ? get_eptep(s, lpn) : NULL;
+    if (!s) {
+        return -1;
+    }
+    if (s->plain) {
+        return 0;   /* no per-page EPTE control in plain mode */
+    }
+    u64 *eptep = get_eptep(s, lpn);
     if (eptep) {
+        {
+            static unsigned dbg_n;
+            if (femu_cxldbg_on() && dbg_n < 64) {
+                dbg_n++;
+                fprintf(stderr, "CXLDBG FLIP lpn=%lld eptep=%p old=0x%" PRIx64 " newhpa=0x%" PRIx64 "\n",
+                        (long long)lpn, (void *)eptep, (uint64_t)*eptep, (uint64_t)hpa);
+            }
+        }
         *eptep = (hpa & ~(uint64_t)(4096 - 1)) | DIRECT_MASK;
-        fprintf(stderr, "Cylon DER-KVM: set direct EPTE for page %lld (hpa 0x%llx)\n",
-                (long long)lpn, (long long)hpa);
+        {
+            static int verbose = -1;
+            if (verbose < 0) {
+                verbose = getenv("FEMU_DER_VERBOSE") ? 1 : 0;
+            }
+            if (verbose) {
+                fprintf(stderr, "Cylon DER-KVM: set direct EPTE for page %lld (hpa 0x%llx)\n",
+                        (long long)lpn, (long long)hpa);
+            }
+        }
         return 0;
     }
     return -1;
@@ -145,6 +211,56 @@ int der_kvm_set_user_memory_region(const FemuCtrl *n)
             (uint64_t)s->guest_phys_addr, (uint64_t)s->memory_size);
     init_leaf_ept(s);
     s->init_done = true;
+    return 0;
+}
+
+/*
+ * Acceptance/debug mode: register the window as a plain RAM memslot
+ * (flags = 0, no DUAL_MODE, no linear EPT). Guest accesses become EPT
+ * direct into logical_space: zero VM exits, no cfmws IO dispatch, no
+ * FTL/cache involvement. The PNM engine reads the same logical_space, so
+ * guest and engine stay coherent.
+ */
+int der_kvm_set_user_memory_region_plain(const FemuCtrl *n)
+{
+    KVMState *kvm = kvm_state;
+    struct kvm_userspace_memory_region mem;
+    Cxlssd *ctx = cxlssd_ctx_from_ctrl((FemuCtrl *)n);
+    DerKvmState *s;
+    int ret;
+
+    if (!n || !n->mbe) {
+        return -1;
+    }
+    if (!ctx || !ctx->der_kvm) {
+        return -1;
+    }
+    s = ctx->der_kvm;
+
+    s->guest_phys_addr = n->base_gpa ? n->base_gpa : femu_get_base_gpa();
+    if (!s->guest_phys_addr) {
+        fprintf(stderr, "Cylon DER-KVM: guest_phys_addr is 0 (base_gpa not set)\n");
+        return -1;
+    }
+    s->memory_size = n->mbe->size;
+    s->userspace_addr = n->mbe->logical_space;
+
+    mem.slot = DER_KVM_SLOT_ID;
+    mem.guest_phys_addr = s->guest_phys_addr;
+    mem.memory_size = s->memory_size;
+    mem.userspace_addr = (uint64_t)(uintptr_t)s->userspace_addr;
+    mem.flags = 0;
+
+    ret = kvm_vm_ioctl(kvm, KVM_SET_USER_MEMORY_REGION, &mem);
+    if (ret < 0) {
+        perror("Cylon DER-KVM: KVM_SET_USER_MEMORY_REGION (plain)");
+        return -1;
+    }
+
+    s->plain = true;
+    fprintf(stderr, "Cylon DER-KVM: plain RAM memslot registered (gpa 0x%" PRIx64
+            " size %" PRIu64 ", EPT direct, zero-exit acceptance mode)\n",
+            (uint64_t)s->guest_phys_addr, (uint64_t)s->memory_size);
     return 0;
 }
 

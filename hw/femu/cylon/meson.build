@@ -1,6 +1,7 @@
 # CXLSSD sources
 cxlssd_sources = files(
     'cxlssd.c',
+    'pnm.c',
     'ftl_thread.c',
     'der_kvm.c',
     'cache/cache.c',

@@ -1,6 +1,7 @@
 # Cylon CXL-SSD and cache (cylon/); shared FTL (ftl/); BBSSD (bbssd/)
 cylon_sources = files(
   'cylon/cxlssd.c',
+  'cylon/pnm.c',
   'cylon/ftl_thread.c',
   'cylon/der_kvm.c',
   'cylon/cache/cache.c',

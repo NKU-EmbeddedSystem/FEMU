@@ -90,6 +90,16 @@ void *ftl_thread_cxlssd(void *arg)
             read = (bool)creq->is_read;
 
             centry = ctx->cache->ops.lookup(ctx->cache->cache_data, lpn);
+            {
+                static unsigned dbg_n;
+                if (femu_cxldbg_on() && (dbg_n < 64 || (dbg_n % 65536) == 0)) {
+                    fprintf(stderr, "CXLDBG FTL #%u rd=%u lpn=%llu hit=%d addr=0x%llx sz=%u\n",
+                            dbg_n, (unsigned)read, (unsigned long long)lpn,
+                            centry ? 1 : 0, (unsigned long long)creq->addr,
+                            (unsigned)creq->size);
+                }
+                dbg_n++;
+            }
             if (centry) {
                 ctx->cache->ops.set_dirty(centry,
                     (ctx->cache->ops.is_dirty(centry) || !read));

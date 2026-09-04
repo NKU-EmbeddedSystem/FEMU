@@ -20,7 +20,7 @@ fi
 
 # Image directory
 # IMGDIR=$HOME/images
-IMGDIR=~/images
+IMGDIR=/home/liz/images
 # Virtual machine disk image
 OSIMGF=$IMGDIR/ubuntu22.qcow2
 
@@ -34,9 +34,19 @@ if [[ ! -e "$OSIMGF" ]]; then
 fi
 
 # CXL-SSD Cache backend memory parameters
-cache_backend_dev="/dev/cmahog"
+# NOTE: must be devdax (/dev/daxN.M). A blockdev/file mmap (/dev/pmem0,
+# fsdax or raw, or a file) is backed by the PAGE CACHE: pages get
+# write-protected during dirty writeback, which deadlocks the FTL fill
+# memcpy in a write-fault loop once the cache dirties past the dirty
+# thresholds. devdax mmap is one-shot remap_pfn_range — no page cache,
+# no faults, stable HPAs. Convert with:
+#   ndctl destroy-namespace namespace0.0 --force
+#   ndctl create-namespace -r region0 --mode=devdax
+cache_backend_dev="/dev/dax0.0"
 cache_bdev_offset=0
-cache_hpa_base=0xae80000000
+# fallback only — cache.c reads the true base from the dax device's
+# sysfs resource file at init (region base + devdax data offset)
+cache_hpa_base=0x2000000000
 
 # CXL-SSD DRAM buffer parameters
 policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
@@ -46,6 +56,11 @@ prf_dg=0 # Next-n Prefetch degree
 ssd_size=$1		# in MegaBytes
 bufsz=512
 # bufsz=$((ssd_size/20))
+# skip_ftl=1: guest window accesses bypass the FTL ring/cache and memcpy
+# directly into logical_space (correctness/acceptance mode).
+# skip_ftl=0: full DER timing path — first-touch traps through the FTL
+# (NAND latency + cache insert + EPTE flip). Keep in sync with
+# /tmp/femu-der-disable (present = plain-RAM acceptance memslot).
 skip_ftl=0
 
 # 96GB
@@ -124,13 +139,13 @@ echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
 n_threads=8
 dram_size=16G
 
-sudo x86_64-softmmu/qemu-system-x86_64 \
+sudo /home/liz/FEMU/build/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
     -cpu host \
     -smp $n_threads \
     -m $dram_size,maxmem=128G,slots=8 \
-    -object memory-backend-ram,size=$dram_size,policy=bind,host-nodes=0,id=ram-node0,prealloc=on,prealloc-threads=$n_threads \
+    -object memory-backend-ram,size=$dram_size,policy=bind,host-nodes=1,id=ram-node0,prealloc=on,prealloc-threads=$n_threads \
     -numa node,nodeid=0,cpus=0-$((n_threads-1)),memdev=ram-node0 \
     --overcommit cpu-pm=on \
     -device virtio-scsi-pci,id=scsi0 \

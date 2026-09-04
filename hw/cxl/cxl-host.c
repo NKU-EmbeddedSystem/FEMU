@@ -12,6 +12,7 @@
 #include "qapi/error.h"
 #include "sysemu/qtest.h"
 #include "hw/boards.h"
+#include "hw/femu/femu.h"     /* femu_cxldbg_on() */
 
 #include "qapi/qapi-visit-machine.h"
 #include "hw/cxl/cxl.h"
@@ -250,6 +251,14 @@ static MemTxResult cxl_read_cfmws(void *opaque, hwaddr addr, uint64_t *data,
     PCIDevice *d;
 
     d = cxl_cfmws_find_device(fw, addr);
+    {
+        static unsigned n;
+        if (femu_cxldbg_on() && n < 64) {
+            n++;
+            fprintf(stderr, "CXLDBG CFMWS R addr=0x%" PRIx64 " sz=%u dev=%p\n",
+                    (uint64_t)addr, size, (void *)d);
+        }
+    }
     if (d == NULL) {
         *data = 0;
         /* Reads to invalid address return poison */
@@ -267,6 +276,14 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
     PCIDevice *d;
 
     d = cxl_cfmws_find_device(fw, addr);
+    {
+        static unsigned n;
+        if (femu_cxldbg_on() && n < 64) {
+            n++;
+            fprintf(stderr, "CXLDBG CFMWS W addr=0x%" PRIx64 " sz=%u data=0x%" PRIx64 " dev=%p\n",
+                    (uint64_t)addr, size, data, (void *)d);
+        }
+    }
     if (d == NULL) {
         /* Writes to invalid address are silent */
         return MEMTX_OK;

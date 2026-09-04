@@ -50,7 +50,11 @@ typedef struct cxlssd {
     uint32_t cca_ring_count;
 
     /* Cylon cache plugin (optional) */
+    /* Cylon cache plugin (optional) */
     struct cache_plugin *cache;
+
+    /* PNM engine (ANNS offload engine thread, in pnm.c) */
+    void *pnm;
 } Cxlssd;
 
 struct ssd;
@@ -61,5 +65,9 @@ Cxlssd *cxlssd_ctx_from_ssd(struct ssd *ssd);
 
 /* Get CXLSSD context from controller (NULL if not cxlssd). */
 Cxlssd *cxlssd_ctx_from_ctrl(struct FemuCtrl *n);
+
+/* PNM engine lifecycle (pnm.c): start/stop the ANNS offload engine thread */
+void pnm_start(Cxlssd *ctx, struct FemuCtrl *n);
+void pnm_stop(Cxlssd *ctx);
 
 #endif

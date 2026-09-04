@@ -3,6 +3,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/queue.h"
+#include "qemu/thread.h"
 #include <glib.h>
 
 struct ssd;
@@ -63,6 +64,9 @@ typedef struct Cache {
     int64_t nand_size;
     uint32_t next_slot;      /* slot allocator */
     uint32_t nr_slots;
+    /* Guards tree/policy mutations (FTL thread) against concurrent lookups
+     * from the PNM engine thread; GTree is not thread-safe. */
+    QemuMutex lock;
 } Cache;
 
 /* Flush one page from cache to NAND (implemented in FTL) */
@@ -73,6 +77,12 @@ void cache_destroy(Cache *c);
 
 CacheEntry *cache_lookup(Cache *c, lpn_t lpn);
 int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch);
+
+/* Thread-safe slot lookup for cross-thread readers (e.g. the PNM engine):
+ * returns the slot id by value, or UINT32_MAX on miss. Unlike
+ * cache_lookup() the returned value stays valid after the lock is dropped
+ * (no dangling CacheEntry pointer if the FTL thread evicts the page). */
+uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn);
 
 /* Set backends for NAND <-> cache_backend memcpy (call after create) */
 void cache_set_backend(Cache *c, void *cache_buf, int64_t cache_buf_size,

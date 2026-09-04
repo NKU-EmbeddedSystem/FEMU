@@ -24,6 +24,32 @@ static int lpn_cmp(const void *a, const void *b)
     return 0;
 }
 
+/*
+ * Real HPA of a page in our own address space, via /proc/self/pagemap.
+ * Used to sanity/derive the cache backend's HPA base: the run script's
+ * cache_hpa_base is the pmem REGION base, but in pfn ("memory") namespace
+ * mode the block device's data area starts at region base + data offset
+ * (>= 2MB) — so the param can point outside the mmap and guest direct
+ * EPTEs would target the reserved metadata area. Translating our own mmap
+ * is offset-proof. Returns 0 if not resolvable (needs CAP_SYS_ADMIN for
+ * the PFN; FEMU runs as root). QEMU is single-threaded here, no locking.
+ */
+static uint64_t cache_pagemap_hpa(const void *page)
+{
+    uint64_t ent = 0;
+    FILE *f = fopen("/proc/self/pagemap", "rb");
+    if (!f) {
+        return 0;
+    }
+    if (fseek(f, (long)(((uintptr_t)page >> 12) * 8), SEEK_SET) == 0 &&
+        fread(&ent, sizeof(ent), 1, f) == 1 && (ent & (1ULL << 63))) {
+        fclose(f);
+        return (ent & ((1ULL << 55) - 1)) << 12;
+    }
+    fclose(f);
+    return 0;
+}
+
 int cylon_cache_backend_init(FemuCtrl *n, CylonCacheBackend *out)
 {
     int fd;
@@ -69,7 +95,64 @@ int cylon_cache_backend_init(FemuCtrl *n, CylonCacheBackend *out)
 
     out->buf_space = p;
     out->buf_size = csize;
-    out->hpa_base = n->cache_hpa_base;
+
+    /* Resolve the HPA base of the backend mapping. Any blockdev/file mmap
+     * (fsdax, raw, regular file) is backed by PAGE CACHE — reclaimable,
+     * writeback-write-protected pages: the DER guest-direct EPTEs must
+     * never point there (we saw a 1.7M/s write-fault loop on a dirty
+     * page-cache page). The backend therefore must be devdax
+     * (/dev/daxN.M, mmap = one-shot remap_pfn_range, VM_PFNMAP, no page
+     * cache). For devdax the sysfs resource file is the authoritative
+     * physical base of the mapping; pagemap may not expose PFNs for
+     * VM_PFNMAP entries, so keep it only as a cross-check, and the
+     * cache_hpa_base param as last resort. */
+    {
+        const char *dev = n->cache_backend_dev;
+        const char *bn = strrchr(dev, '/');
+        bn = bn ? bn + 1 : dev;
+        uint64_t derived = 0;
+        uint64_t res = 0;
+
+        if (!strncmp(dev, "/dev/dax", 8)) {
+            char sysfs[256], line[64];
+            FILE *sf;
+            snprintf(sysfs, sizeof(sysfs),
+                     "/sys/bus/dax/devices/%s/resource", bn);
+            sf = fopen(sysfs, "r");
+            if (sf) {
+                /* the file holds "0x..." — %llu stops at the 'x', so
+                 * parse the line with strtoull (base 0 autodetects) */
+                if (fgets(line, sizeof(line), sf)) {
+                    res = (uint64_t)strtoull(line, NULL, 0);
+                }
+                fclose(sf);
+            }
+            if (!res) {
+                femu_err("Cylon DER cache: devdax %s: no sysfs resource "
+                         "(falling back to pagemap/param)\n", bn);
+            }
+        }
+
+        derived = cache_pagemap_hpa(p);
+        if (res) {
+            out->hpa_base = res + (uint64_t)n->cache_bdev_offset;
+            if (derived && derived != out->hpa_base) {
+                femu_err("Cylon DER cache: hpa sysfs 0x%" PRIx64
+                         " != pagemap 0x%" PRIx64 " (sysfs wins)\n",
+                         out->hpa_base, derived);
+            }
+        } else if (derived) {
+            out->hpa_base = derived;
+            if (derived != n->cache_hpa_base) {
+                femu_err("Cylon DER cache: hpa derived via pagemap 0x%" PRIx64
+                         " != param 0x%" PRIx64 " (param IGNORED — likely pfn "
+                         "namespace data offset)\n",
+                         derived, (uint64_t)n->cache_hpa_base);
+            }
+        } else {
+            out->hpa_base = n->cache_hpa_base;
+        }
+    }
 
     femu_log("Cylon DER cache backend: %s offset 0x%" PRIx64 " size %" PRId64 " MB, hpa_base 0x%" PRIx64 "\n",
              n->cache_backend_dev, (uint64_t)n->cache_bdev_offset, (int64_t)n->bufsz, out->hpa_base);
@@ -151,6 +234,7 @@ Cache *cache_create(struct ssd *ssd, int policy_id, int size, CacheWay way)
     c->nand_buf = NULL;
     c->nr_slots = 0;
     c->next_slot = 0;
+    qemu_mutex_init(&c->lock);
     c->sets = g_malloc0(sizeof(CacheSet) * (size_t)c->nr_sets);
     for (int i = 0; i < c->nr_sets; i++) {
         QTAILQ_INIT(&c->sets[i].queue);
@@ -175,6 +259,7 @@ void cache_destroy(Cache *c)
     if (c->tree) {
         g_tree_destroy(c->tree);
     }
+    qemu_mutex_destroy(&c->lock);
     g_free(c);
 }
 
@@ -182,6 +267,19 @@ CacheEntry *cache_lookup(Cache *c, lpn_t lpn)
 {
     CacheEntry key = { .lpn = lpn };
     return g_tree_lookup(c->tree, &key);
+}
+
+uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn)
+{
+    CacheEntry key = { .lpn = lpn };
+    CacheEntry *e;
+    uint32_t slot;
+
+    qemu_mutex_lock(&c->lock);
+    e = g_tree_lookup(c->tree, &key);
+    slot = e ? e->slot_id : UINT32_MAX;
+    qemu_mutex_unlock(&c->lock);
+    return slot;
 }
 
 /* High-level insert: eviction (epte_set_trap + flush), memcpy, epte_set_direct, then policy insert */
@@ -193,6 +291,7 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
     CacheWay way = cache_get_way(c);
     int ent_max = (way == CACHE_WAY_FULL) ? cache_get_size(c) : (1 << way);
     CacheEntry key = { .lpn = entry->lpn };
+    int rc;
 
     (void)prefetch;
 
@@ -200,13 +299,17 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
         return -1;
     }
 
+    qemu_mutex_lock(&c->lock);
+
     if (g_tree_lookup(c->tree, &key)) {
+        qemu_mutex_unlock(&c->lock);
         return c->policy->insert_entry(c, entry);
     }
 
     while (set->count >= ent_max) {
         CacheEntry *victim = c->policy->evict_victim(c, set);
         if (!victim) {
+            qemu_mutex_unlock(&c->lock);
             return -1;
         }
         if (ctx && ctx->der_kvm) {
@@ -249,7 +352,9 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
 
     fprintf(stderr, "Cylon cache: inserted page %lld into slot %u (hpa 0x%llx)\n",
             (long long)entry->lpn, entry->slot_id, (long long)ctx->cache_backend.hpa_base + (uint64_t)entry->slot_id * CACHE_PAGE_SIZE);
-    return c->policy->insert_entry(c, entry);
+    rc = c->policy->insert_entry(c, entry);
+    qemu_mutex_unlock(&c->lock);
+    return rc;
 }
 
 /* ---- Plugin ops (cache_ops_t: void *cache_data, struct cache_entry *) ---- */
