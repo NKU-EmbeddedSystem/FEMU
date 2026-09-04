@@ -190,6 +190,17 @@ void cache_flush_page(struct ssd *ssd, lpn_t lpn)
     if (!c->cache_buf || !c->nand_buf) {
         return;
     }
+    /* guard: a flush to an out-of-range (or window-tail control page) lpn
+     * means a corrupted/ghost CacheEntry — writing slot content there would
+     * silently destroy the mailbox/results area. Refuse loudly. */
+    if ((uint64_t)lpn >= (uint64_t)(c->nand_size >> 12) ||
+        (ctx->der_kvm && ctx->der_kvm->init_done && !ctx->der_kvm->plain &&
+         lpn + DER_TAIL_PIN_PAGES >= (ctx->der_kvm->memory_size >> 12))) {
+        fprintf(stderr, "Cylon cache: !! flush REFUSED bad/tail lpn %lld "
+                "(nand pages %lld)\n", (long long)lpn,
+                (long long)(c->nand_size >> 12));
+        return;
+    }
     e = g_tree_lookup(c->tree, &key);
     if (!e) {
         return;
@@ -208,7 +219,12 @@ void cache_set_backend(Cache *c, void *cache_buf, int64_t cache_buf_size,
     c->nand_buf = nand_buf;
     c->nand_size = nand_size;
     c->nr_slots = (cache_buf_size > 0 && cache_buf) ? (uint32_t)(cache_buf_size / CACHE_PAGE_SIZE) : 0;
-    c->next_slot = 0;
+    g_free(c->free_slots);
+    c->free_slots = c->nr_slots ? g_malloc(sizeof(uint32_t) * c->nr_slots) : NULL;
+    for (uint32_t i = 0; i < c->nr_slots; i++) {
+        c->free_slots[i] = i;
+    }
+    c->free_top = c->nr_slots;
 }
 
 Cache *cache_create(struct ssd *ssd, int policy_id, int size, CacheWay way)
@@ -233,7 +249,8 @@ Cache *cache_create(struct ssd *ssd, int policy_id, int size, CacheWay way)
     c->cache_buf = NULL;
     c->nand_buf = NULL;
     c->nr_slots = 0;
-    c->next_slot = 0;
+    c->free_slots = NULL;
+    c->free_top = 0;
     qemu_mutex_init(&c->lock);
     c->sets = g_malloc0(sizeof(CacheSet) * (size_t)c->nr_sets);
     for (int i = 0; i < c->nr_sets; i++) {
@@ -259,6 +276,7 @@ void cache_destroy(Cache *c)
     if (c->tree) {
         g_tree_destroy(c->tree);
     }
+    g_free(c->free_slots);
     qemu_mutex_destroy(&c->lock);
     g_free(c);
 }
@@ -299,6 +317,30 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
         return -1;
     }
 
+    /* out-of-range lpn: a garbage offset/neighbor id must never allocate a
+     * slot (the fill would read past nand_buf) — the one-sided tail check
+     * below happened to catch these too, but with its own message */
+    if (c->nand_size && (uint64_t)entry->lpn >= (uint64_t)(c->nand_size >> 12)) {
+        static unsigned warned;
+        if (warned++ < 8) {
+            fprintf(stderr, "Cylon cache: !! insert REFUSED out-of-range lpn %lld "
+                    "(nand pages %lld)\n", (long long)entry->lpn,
+                    (long long)(c->nand_size >> 12));
+        }
+        return -1;
+    }
+    /* tail control pages (mailbox/results/query) never enter the cache:
+     * they self-pin direct at their first trap (cxlssd.c) */
+    if (ctx && ctx->der_kvm && ctx->der_kvm->init_done && !ctx->der_kvm->plain &&
+        entry->lpn + DER_TAIL_PIN_PAGES >= (ctx->der_kvm->memory_size >> 12)) {
+        static unsigned warned;
+        if (warned++ < 8) {
+            fprintf(stderr, "Cylon cache: !! insert REFUSED tail lpn %lld\n",
+                    (long long)entry->lpn);
+        }
+        return -1;
+    }
+
     qemu_mutex_lock(&c->lock);
 
     if (g_tree_lookup(c->tree, &key)) {
@@ -318,8 +360,11 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
                         (long long)victim->lpn);
             }
         }
-        fprintf(stderr, "Cylon cache: evicted page %lld from slot %u (hpa 0x%llx)\n",
-                    (long long)victim->lpn, victim->slot_id, (long long)ctx->cache_backend.hpa_base + (uint64_t)victim->slot_id * CACHE_PAGE_SIZE);
+        if (femu_cxldbg_on()) {
+            fprintf(stderr, "Cylon cache: evicted page %lld from slot %u (hpa 0x%llx)\n",
+                    (long long)victim->lpn, victim->slot_id,
+                    (long long)ctx->cache_backend.hpa_base + (uint64_t)victim->slot_id * CACHE_PAGE_SIZE);
+        }
 
         cache_flush_page(ssd, victim->lpn);
         g_tree_remove(c->tree, victim);
@@ -330,9 +375,15 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
         cache_entry_free(victim);
     }
 
-    if (entry->slot_id == 0 && c->cache_buf && c->nr_slots > 0) {
-        entry->slot_id = c->next_slot % c->nr_slots;
-        c->next_slot++;
+    if (entry->slot_id == UINT32_MAX && c->cache_buf && c->nr_slots > 0) {
+        if (c->free_top > 0) {
+            entry->slot_id = c->free_slots[--c->free_top];
+        } else {
+            /* no free slot and the set didn't need an eviction (multi-set
+             * ways): refuse rather than alias a live entry's slot */
+            qemu_mutex_unlock(&c->lock);
+            return -1;
+        }
     }
 
     if (c->cache_buf && c->nand_buf && c->nr_slots > 0) {
@@ -350,11 +401,57 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
         }
     }
 
-    fprintf(stderr, "Cylon cache: inserted page %lld into slot %u (hpa 0x%llx)\n",
-            (long long)entry->lpn, entry->slot_id, (long long)ctx->cache_backend.hpa_base + (uint64_t)entry->slot_id * CACHE_PAGE_SIZE);
+    if (femu_cxldbg_on()) {
+        fprintf(stderr, "Cylon cache: inserted page %lld into slot %u (hpa 0x%llx)\n",
+                (long long)entry->lpn, entry->slot_id,
+                (long long)ctx->cache_backend.hpa_base + (uint64_t)entry->slot_id * CACHE_PAGE_SIZE);
+    }
     rc = c->policy->insert_entry(c, entry);
     qemu_mutex_unlock(&c->lock);
     return rc;
+}
+
+/* Experiment-level cold reset: write every resident slot back to NAND,
+ * drop all entries (through each policy's own evict path so per-policy
+ * state stays consistent), re-trap every window page and restart the slot
+ * allocator. Called from the PNM FLUSH job between experiments so a re-run
+ * on the same FEMU starts from a cold, coherent cache — leftover direct
+ * EPTEs from the previous run would otherwise let guest staging bypass the
+ * FTL entirely (observed: 3s staging + BIND bad magic). */
+void cylon_cache_reset(Cache *c)
+{
+    struct ssd *ssd = cache_get_ssd(c);
+    Cxlssd *ctx = cxlssd_ctx_from_ssd(ssd);
+
+    if (!c->policy || !c->policy->evict_victim) {
+        return;
+    }
+
+    qemu_mutex_lock(&c->lock);
+    for (int s = 0; s < c->nr_sets; s++) {
+        CacheSet *set = &c->sets[s];
+        while (set->count > 0) {
+            CacheEntry *victim = c->policy->evict_victim(c, set);
+            if (!victim) {
+                break;      /* policy bookkeeping off; stop, don't spin */
+            }
+            if (ctx && ctx->der_kvm) {
+                der_kvm_epte_set_trap(ctx, victim->lpn);
+            }
+            cache_flush_page(ssd, victim->lpn);
+            g_tree_remove(c->tree, victim);
+            cache_dec_entry_count(c);
+            cache_dec_set_count(set);
+            c->stats.evict_count++;
+            cache_entry_free(victim);
+        }
+    }
+    /* every entry (and its slot) was dropped above: rebuild the free stack */
+    for (uint32_t i = 0; i < c->nr_slots; i++) {
+        c->free_slots[i] = i;
+    }
+    c->free_top = c->nr_slots;
+    qemu_mutex_unlock(&c->lock);
 }
 
 /* ---- Plugin ops (cache_ops_t: void *cache_data, struct cache_entry *) ---- */
@@ -389,7 +486,7 @@ static struct cache_entry *plugin_entry_init(void *cache_data, lpn_t lpn)
     e->lpn = lpn;
     e->dirty = false;
     e->policy_data = NULL;
-    e->slot_id = 0;
+    e->slot_id = UINT32_MAX;    /* "unassigned" — 0 is a real slot */
     (void)cache_data;
     return (struct cache_entry *)e;
 }

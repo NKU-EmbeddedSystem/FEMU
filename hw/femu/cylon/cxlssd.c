@@ -401,6 +401,15 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
         memcpy(data, (const char *)n->mbe->logical_space + addr, size);
         return MEMTX_OK;
     }
+    /* window-tail control pages (PNM mailbox/results/query): bypass the
+     * FTL/cache and self-pin the EPTE direct to logical_space on this
+     * first trap — afterwards no trap, no cache slot, immune to churn */
+    if (n->mbe->size - addr <= (uint64_t)DER_TAIL_PIN_PAGES * 4096) {
+        Cxlssd *ctx = cxlssd_ctx_from_ctrl(n);
+        der_kvm_pin_tail_page(ctx, addr >> 12);
+        memcpy(data, (const char *)n->mbe->logical_space + addr, size);
+        return MEMTX_OK;
+    }
     wait_for_buf_update(n, addr, CXL_READ, size, data);
     return MEMTX_OK;
 }
@@ -419,6 +428,13 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
     }
 
     if (n->cxl_skip_ftl) {
+        memcpy((char *)n->mbe->logical_space + addr, &data, size);
+        return MEMTX_OK;
+    }
+    /* window-tail control pages: see cxlssd_mem_read */
+    if (n->mbe->size - addr <= (uint64_t)DER_TAIL_PIN_PAGES * 4096) {
+        Cxlssd *ctx = cxlssd_ctx_from_ctrl(n);
+        der_kvm_pin_tail_page(ctx, addr >> 12);
         memcpy((char *)n->mbe->logical_space + addr, &data, size);
         return MEMTX_OK;
     }

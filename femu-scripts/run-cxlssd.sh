@@ -54,7 +54,9 @@ prf_dg=0 # Next-n Prefetch degree
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
-bufsz=512
+# DSE sweep: cache size vs 495MB SIFT1M index (512 = full residency,
+# 256/128/64 = partial -> search-time misses pay NAND latency)
+bufsz=256
 # bufsz=$((ssd_size/20))
 # skip_ftl=1: guest window accesses bypass the FTL ring/cache and memcpy
 # directly into logical_space (correctness/acceptance mode).

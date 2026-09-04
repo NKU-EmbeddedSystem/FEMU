@@ -17,6 +17,25 @@ extern int kvm_vm_ioctl(KVMState *s, int type, ...);
 #define DIRECT_MASK  0x600000000000977ULL
 #define MMIO_MASK    0x0000000586ULL
 
+/* Real HPA of a page in our own address space via /proc/self/pagemap
+ * (FEMU runs as root; logical_space is anonymous, pre-faulted and mlocked
+ * by init_dram_backend, so the translation is stable). */
+static uint64_t der_kvm_pagemap_hpa(const void *page)
+{
+    uint64_t ent = 0;
+    FILE *f = fopen("/proc/self/pagemap", "rb");
+    if (!f) {
+        return 0;
+    }
+    if (fseek(f, (long)(((uintptr_t)page >> 12) * 8), SEEK_SET) == 0 &&
+        fread(&ent, sizeof(ent), 1, f) == 1 && (ent & (1ULL << 63))) {
+        fclose(f);
+        return (ent & ((1ULL << 55) - 1)) << 12;
+    }
+    fclose(f);
+    return 0;
+}
+
 /* EPT chunk index for an lpn. Chunks are MAX_CONT_ALLOC_SZ (4MB) = 524288
  * entries, so chunk = lpn >> 19. (A previous (lpn*8)>>20 = lpn>>17 was 4x
  * too large: every page above 512MB of window indexed past its chunk and
@@ -89,6 +108,35 @@ uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn)
     return (uint64_t *)get_eptep(s, lpn);
 }
 
+/* Flip one window-tail page's EPTE direct to its logical_space HPA. Must be
+ * called from the TRAP path: KVM's dual-mode leaves materialize on first
+ * walk (populated with the default trap value), so a leaf pre-written at
+ * init gets overwritten on first walk — observed when the init-time pin
+ * failed and the mailbox page landed in cache slot 0 at the first job.
+ * Called with the leaf materialized, the write sticks like any FTL flip.
+ * Idempotent. */
+void der_kvm_pin_tail_page(Cxlssd *ctx, uint64_t lpn)
+{
+    DerKvmState *s = ctx ? ctx->der_kvm : NULL;
+    uint64_t hpa;
+
+    if (!s || !s->init_done || s->plain) {
+        return;
+    }
+    if (lpn + DER_TAIL_PIN_PAGES < (s->memory_size >> 12)) {
+        return;     /* not a tail page */
+    }
+    hpa = der_kvm_pagemap_hpa((const char *)s->userspace_addr + (lpn << 12));
+    if (!hpa) {
+        fprintf(stderr, "Cylon DER-KVM: !! tail pin: no HPA for lpn %llu\n",
+                (long long)lpn);
+        return;
+    }
+    s->pinning = true;      /* legit tail flip: tripwire off */
+    der_kvm_epte_set_driect(ctx, lpn, hpa);
+    s->pinning = false;
+}
+
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
 {
     DerKvmState *s = ctx ? ctx->der_kvm : NULL;
@@ -97,6 +145,13 @@ int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
     }
     if (s->plain) {
         return 0;   /* no per-page EPTE control in plain mode */
+    }
+    /* tripwire: the window tail (PNM mailbox/results/query) is pinned direct
+     * at init and must NEVER be flipped again — a flip here means something
+     * is trying to put a control page into a recyclable cache slot */
+    if (s->init_done && lpn + DER_TAIL_PIN_PAGES >= (s->memory_size >> 12)) {
+        fprintf(stderr, "Cylon DER-KVM: !! TAIL FLIP trap lpn=%llu caller=%p\n",
+                (long long)lpn, __builtin_return_address(0));
     }
     uint64_t gfn = (s->guest_phys_addr >> PAGE_SHIFT) + lpn;
     u64 *eptep = get_eptep(s, lpn);
@@ -133,6 +188,13 @@ int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa)
     }
     if (s->plain) {
         return 0;   /* no per-page EPTE control in plain mode */
+    }
+    /* tripwire: see der_kvm_epte_set_trap; s->pinning lets the init loop
+     * itself set the tail direct without tripping */
+    if (s->init_done && !s->pinning &&
+        lpn + DER_TAIL_PIN_PAGES >= (s->memory_size >> 12)) {
+        fprintf(stderr, "Cylon DER-KVM: !! TAIL FLIP direct lpn=%llu hpa=0x%llx caller=%p\n",
+                (long long)lpn, (long long)hpa, __builtin_return_address(0));
     }
     u64 *eptep = get_eptep(s, lpn);
     if (eptep) {

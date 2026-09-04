@@ -37,11 +37,17 @@ struct kvm_memslot_get_linear_ept {
 
 #define DER_KVM_SLOT_ID (0x2AU)
 
+/* window-tail pages pinned EPT-direct to logical_space: covers the PNM
+ * mailbox / results / query scratch (PNM_*_OFF_FROM_END <= 77824, so 32
+ * pages = 128KB with margin). Never cache-resident, never flipped. */
+#define DER_TAIL_PIN_PAGES  32
+
 /* Per-CXLSSD KVM memslot/EPT state (lives in Cxlssd.der_kvm) */
 typedef struct DerKvmState {
     struct kvm_memslot_get_linear_ept ept;
     bool init_done;
     bool plain;              /* plain RAM memslot, no DUAL_MODE/linear EPT */
+    bool pinning;            /* inside the init tail-pin loop (tripwire off) */
     void *userspace_addr;
     uint64_t memory_size;
     uint64_t guest_phys_addr;
@@ -53,6 +59,9 @@ typedef struct DerKvmState {
 
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn);
 int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa);
+/* Pin a window-tail control page direct to logical_space (call from the
+ * trap path — see der_kvm.c). Never cachable, never flipped again. */
+void der_kvm_pin_tail_page(Cxlssd *ctx, uint64_t lpn);
 uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn);
 
 int der_kvm_set_user_memory_region(const FemuCtrl *n);

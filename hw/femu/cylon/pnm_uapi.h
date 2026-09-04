@@ -22,6 +22,11 @@
 #define PNM_OP_NOP          0
 #define PNM_OP_BIND_INDEX   1   /* a0 = window offset of CYH1 index blob */
 #define PNM_OP_ANNS_SEARCH  2   /* a0 = query_off, a1 = result_off, k, ef */
+#define PNM_OP_CACHE_FLUSH  3   /* cold-start the device cache: write all
+                                 * resident slots back to NAND, drop every
+                                 * entry, re-trap every window EPTE. Issue
+                                 * before staging so a re-run on a live FEMU
+                                 * doesn't stage through stale direct EPTEs */
 
 /* status codes */
 #define PNM_ST_OK           0
@@ -62,7 +67,7 @@ struct pnm_resp_s {
     uint64_t total_ns;
     uint64_t n_dist;      /* distance computations */
     uint64_t n_hops;      /* neighbor-list expansions */
-    uint64_t n_pages;     /* distinct 4K pages touched */
+    uint64_t n_pages;     /* search-time cache misses (NAND page reads charged) */
 };
 
 /* mailbox (one outstanding job in Phase A) */

@@ -133,16 +133,25 @@ void *ftl_thread_cxlssd(void *arg)
                 ctx->cache->ops.insert(ctx->cache->cache_data, centry, INSERT_PREFETCH);
             }
 
-            /* Memory operation: copy between cache backend slot and guest (data_ptr) */
-            if (creq->data_ptr && creq->size && ctx->cache_backend.buf_space) {
+            /* Memory operation: copy between cache backend slot and guest (data_ptr).
+             * If the insert was refused (no free slot), the entry carries the
+             * UINT32_MAX sentinel: bypass the slot array and go through the
+             * logical-space view of the page instead of indexing OOB. */
+            if (creq->data_ptr && creq->size) {
                 uint32_t slot_id = ctx->cache->ops.get_slot_id(centry);
                 uint64_t off = creq->addr % CACHE_PAGE_SIZE;
-                char *slot_ptr = (char *)ctx->cache_backend.buf_space
-                    + (size_t)slot_id * CACHE_PAGE_SIZE + (size_t)off;
-                if (read) {
-                    memcpy(creq->data_ptr, slot_ptr, creq->size);
+                char *page;
+                if (slot_id != UINT32_MAX && ctx->cache_backend.buf_space) {
+                    page = (char *)ctx->cache_backend.buf_space
+                         + (size_t)slot_id * CACHE_PAGE_SIZE + off;
                 } else {
-                    memcpy(slot_ptr, creq->data_ptr, creq->size);
+                    page = (char *)n->mbe->logical_space
+                         + (creq->addr - off) + off;
+                }
+                if (read) {
+                    memcpy(creq->data_ptr, page, creq->size);
+                } else {
+                    memcpy(page, creq->data_ptr, creq->size);
                 }
             }
 

@@ -295,13 +295,60 @@ cd /var/tmp/anns && sudo /tmp/pnm_client -f cyh1_sift1m.blob -q queries_fp16.bin
 # host: scp 回来后 cmp engref_ef100.dump guest_full_der.dump → 应逐字节相同
 ```
 
+## 8.5 cache-aware 搜索模式（Phase B，2026-09-04 验证通过）
+
+Phase A 引擎 BIND 时把整份索引快照进本地内存（local copy）；Phase B 起默认 **cache-aware**：
+每次图读（向量/邻接表）都走缓存层级，`bufsz/policy/prefetch` 真正塑造搜索延迟。
+
+- **模式开关**（`pnm.c pnm_use_local_copy`）：默认 cache-aware；`PNM_LOCAL_COPY=1`（FEMU env）
+  强制 Phase A local copy；验收模式（`cxl_skip_ftl=1`）自动强制 local copy（无 FTL 无缓存可走）。
+- **`pnm_graph_read` 语义**：slot 命中零开销；缺失 = 完整插入路径（策略 insert + 驱逐）+ 计一次
+  `pg_rd_lat`（40µs），resp 的 `n_pages` = 每 query miss 数（SIFT1M/ef=100 冷缓存平均 251.9，
+  跨 query 变暖：首 query ~2700 → 尾部 ~180）。窗口越界读 = 零填充 + `!! graph read past window end`
+  告警（不 crash——脏数据由 dump 门禁兜底）。
+- **尾页自钉**（`DER_TAIL_PIN_PAGES=32`，der_kvm.c）：mailbox/results/query 尾页在**首次 trap 时**
+  自钉 direct（dual-mode leaf 首 walk 才物化，init 预写无效），永不入缓存；cache insert/flush 双守卫
+  拒绝（日志 `insert REFUSED tail` / `flush REFUSED`），der_kvm 侧 TAIL FLIP tripwire。
+- **slot 所有权 = free-slot LIFO 栈**（cache.c）：slot 入服务仅经 pop（或驱逐直传），回收仅经
+  `cylon_cache_reset`——所有权独占。**旧 sentinel-0 + `next_slot%nr_slots` 盲分配器会 alias**：
+  驱逐继承 slot 0 时分配器二次触发，把在用 slot 发给第二个 entry，一页 fill 覆盖另一页 →
+  引擎把向量 fp16 位型当邻接 id（如 0x51E04A00≈(47.0,8.0)）→ 出窗读 → `logical_space+off`
+  兜底越界 → QEMU SIGSEGV；alias 随驱逐自愈，故表现为**随机中途崩溃**（ca256/ca256b 幸存、
+  第三 run 在 search 911 爆）。教训：**跑完没炸 ≠ 正确，dump 门禁 + tripwire 缺一不可**。
+- **`PNM_OP_CACHE_FLUSH`（op=3）**：同 FEMU 重跑前冷复位（pnm_client staging 前自动提交）：
+  全驻留 slot 回写 NAND → 经各策略自身 evict 路径清树 → 全窗 EPTE 复位 trap → 重建 free 栈。
+  不做则 staging 走残留 direct EPTE 绕过 FTL（~3.2s + BIND bad magic，见 §9）。**只复位 cache，
+  不清 FTL map**——重跑 staging 走 read 计费（见下），数据一致性由 NAND 持久保证。
+- **staging 时序三分法**（495MB = 126,720 页，判读重跑健康度）：
+  **~26.5s** = 208µs/页 NAND program 计费（FTL map 空，冷启动首轮）｜**~6s** = 47µs/页 read 计费
+  （map 已映射，FLUSH 后重跑的**正常值**）｜**~3.2s** = 零计费 bypass（**坏签名**）。
+- **canonical tie-break**：~14% 查询 top-10 含相邻等距对，裸 qsort tie 序随堆内序漂移 →
+  `pnm.c pnm_cmp_asc` 与 `engref.c pnm_cnd_asc` 都按 (d, id) 排序。**engref 参考已重生成**
+  （2026-09-04，recall 0.9896→0.9898；旧 dump 系早期 engref 二进制产物，备份 .pre-tiebreak）。
+
+### 8.6 三连验证（修复后，2026-09-04，bufsz=256M/FIFO/ef=100）
+
+| | ca256 冷启动 | ca256b 同 FEMU 重跑 | ca256q2 换查询集重跑* |
+|---|---|---|---|
+| FLUSH job | ✓ →0 | ✓ →0 | ✓ →0 |
+| staging | 26.4s（program 计费） | 6.0s（read 计费，正常） | 6.0s |
+| recall@10 | **0.9898** | **0.9898** | **0.9882**（=engref_q2） |
+| dump vs engref | **逐字节一致** | **逐字节一致** | **逐字节一致（engref_q2）** |
+| engine/query | dist 3516.7 hops 109.1 | 同左（逐位） | dist 3539.3 hops 109.1（=engref_q2） |
+| misses/query | 251.9（cache 冷） | 251.9（cache 冷） | 255.0 |
+
+FEMU 日志：3×1000 search 全完成、3 FLUSH、**零 tripwire**。QPS 63-65（cache-aware 全层级计费）。
+\* 换 test[1000:2000] 子集——**同数据重跑验证不了内容一致性**（bypass 时旧数据照样逐字节对），
+换数据才能证明 FLUSH 后引擎读的是新灌数据（q0 top-10 与新参考一致即证）。
+
 ## 9. 故障排查
 
 | 症状 | 原因/处理 |
 |---|---|
 | guest 里碰 CXL 窗口后 SSH 断、QEMU 控制台无响应 | FTL 线程活锁（已修复：`cxlssd_init` 设 `dataplane_started=true`，改动在本地 FEMU 未提交 git）。若仓库重置需重打补丁 |
 | staging 中途整机冻结（R-state 进程、NMI 不可达、host vCPU 线程栈空） | vCPU 卡死在 host 用户态 bulk MMIO exit 处理里。**用验收模式**（§8.1 plain RAM memslot）绕开；完整 DER 模式下此路径 Phase B 再治 |
-| QEMU 进程直接消失（8080 拒连），log 止于 `BIND job` | 引擎段错误（曾为：visited 位图用旧 count 分配 → memset(NULL)；已修复挪到 count 赋值后） |
+| QEMU 进程直接消失（8080 拒连），log 止于 `search job …` | 同 FEMU 多 run 后随机 SIGSEGV（dmesg: `shr esi,12 … je … mov rax,[rsi]` fault 在 `logical_space+off` 越界）= 旧 slot-alias bug（§8.5，已修）；修复后若再见 `!! graph read past window end` 说明仍有页内容错位，查缓存一致性 |
+| 同 FEMU 重跑：staging ~3.2s 且 BIND bad magic（magic 形如 0x47xxxxxx） | 残留 direct EPTE 绕过 FTL。pnm_client 已自动先 FLUSH（§8.5）；若复现查 cylon_cache_reset 路径 |
 | recall 在 0.92–0.98 随机漂移，dist/hops 却与 host 一致 | 信箱 pickup 竞态：引擎一次 memcpy 读整个信箱，看到"新 PENDING+旧 a0"，~1% job 跑成上一条查询。已修复（先读 status 再读 job+二次校验）。诊断用 `revq`（§8.3） |
 | `nproc` 只有 1 / KVM 报 cpus (1) | L0 进错内核或缺 `X86_X2APIC`（见 §2.1） |
 | `cxl create-region` 报 ENXIO | guest 内核缺 `CXL_REGION_INVALIDATION_TEST`/`CXL_MEM_RAW_COMMANDS`（-3 起 deb 已含） |
