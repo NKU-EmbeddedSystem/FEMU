@@ -759,6 +759,32 @@ static void *pnm_thread_fn(void *opaque)
         uint32_t done = PNM_MB_DONE;
         pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, status),
                   &done, sizeof(done));
+
+        /* D1 Type-2 BI bill: flip the mailbox page (and the results page
+         * the client reads) back to trap so the client's next pickup read
+         * exits into FEMU, where the trap path charges the
+         * snoop-equivalent latency before flipping direct again. Knob is
+         * re-read per job (same live-tune pattern as the compute knob);
+         * 0 = off = E1'-identical behavior. a1=0 ops (NOP/FLUSH) skip the
+         * results-page retrap (not a tail lpn -> no-op). */
+        {
+            uint64_t bi_ns = 0;
+            FILE *bf = fopen("/tmp/femu-bi-lat-ns", "r");
+            if (bf) {
+                char bb[32] = { 0 };
+                if (fgets(bb, sizeof(bb), bf)) {
+                    bi_ns = strtoull(bb, 0, 0);
+                }
+                fclose(bf);
+            }
+            cylon_bi_lat_ns = bi_ns;
+            if (bi_ns) {
+                der_kvm_epte_retrap_control(ctx, mb_off >> 12);
+                der_kvm_epte_retrap_control(ctx, mb.job.a1 >> 12);
+                femu_log("Cylon PNM: BI re-trap job %u (knob %lu ns)\n",
+                         mb.job.job_id, (unsigned long)bi_ns);
+            }
+        }
         /* readback probe: the invariant is that the mailbox page NEVER
          * lives in a cache slot (it is tail-pinned direct); rb == done is
          * racy by design — the client resets the mailbox for the next job

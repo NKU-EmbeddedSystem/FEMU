@@ -41,14 +41,21 @@ Type-2 = 设备有自己的内存（**HDM-DB**：Device-Coherent with Back-Inval
 **动机**：collab 拾取路径（客户端从信箱读引擎结果）目前是纯 DRAM 读、零一致性成本；
 真实 Type-2 每次引擎写→CPU 读交接付 snoop 往返（~200-400ns 量级 + 行粒度序列化）。
 
-**实现**（FEMU 侧）：
-- pnm.c job 完成路径：把引擎写入信箱/结果区的缓存行记入 `bi_pending` 位图（按 64B 行）。
-- 客户端读命中 `bi_pending` 行时，经既有门箱补收 BI 延迟（新活调旋钮
-  `/tmp/femu-bi-lat-ns`，默认 250ns，格式同 comp_dly）；补收后清位。
-- 只对 collab 路径生效；纯引擎 f=0 无 CPU 读，账单为零（可作负对照）。
+**实现**（FEMU 侧，**已实现 2026-09-05**）：
+- pnm.c job 完成路径：信箱页 + 结果页 re-trap 为 trap 态（`der_kvm_epte_retrap_control`）；客户端下一次拾取读触发 EPT violation 进 FEMU，trap 路径按 cacheline 数补收 BI 延迟后自锁直映射（`pin_tail_page`）。活调旋钮 `/tmp/femu-bi-lat-ns`（pnm 线程每 job 读一次，0 = off = 与 E1' 行为逐比特一致，knob 语义同 comp_dly）。
+- re-trap 伴随 `der_kvm_flush_tlbs`（KVM_DER_FLUSH_TLB ioctl）——否则 vCPU TLB 缓存直映射、客户端永远不 trap，静默漏计费；**FEMU_DER_FLUSH=0 时 BI 账单一并失效**。
+- re-trap + flush 每 job 一次（µs 级引擎侧开销，属模拟器机制成本，不计入被建模账单）。
+- 负对照是 bi=0 这条线本身。**修正**：f=0（纯引擎）不是零账单负控——客户端在所有模式下都驱动信箱（提交+拾取），f=0 同样付每查询 2 次 trap 计费；正确的"无账单"对照是 knob=0。
 
-**实验**：E1''= E1' 7 点 × BI ∈ {0, 250, 500, 1000} ns。结果区每千查询仅 44KB →
-预测影响 <1%；若实测果真如此，结论 = "结果拾取对一致性税不敏感"，负对照干净。
+**实验（f=0.5 wiki 21M 列，2026-09-05 验收）**：BI ∈ {0, 250, 500} avx + {1000, 5e6}
+scalar，dump 全部逐字节=engref；wall 115.1 / 114.4 / 114.2 / 115.6 / 117.4 s —— 物理范围
+（CXL.cache snoop 200-400ns）内账单 <0.05% wall（淹没在 ±2s 噪声带），结论成立 =
+**"结果拾取对一致性税不敏感"**；knob=5e6（430× 物理）proof 点 +1.8s 浮出机制，每 run
+恰好 jobs+2 次计费（BIND/FLUSH 各一）。负对照 knob=0 在 FEMU 日志层亦 0 条 re-trap。
+**已知限制**：avx 客户端 @ knob=1000 稳定 #UD（0/2，canary→lazy-resolver 链，取指拿错
+页字节），同 knob scalar 全绿（1/1）→ 非数据路径问题，嫌疑 = PNM 线程每 job 双
+DER-flush 与忙转 avx worker vCPU 的内核侧竞态（与历史 avx-collab 崩溃同族），D3 信箱 v2
+结构性修复。E1'' 全矩阵（E1' 7 点 × BI）待跑。
 
 **验收**：所有点 dump 与 engref 逐字节一致（BI 只改时序不改结果）；新增
 `e1c_bi_sweep` CSV/PNG 进 e1c_paper/。

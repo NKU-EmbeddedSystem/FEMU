@@ -137,6 +137,38 @@ void der_kvm_pin_tail_page(Cxlssd *ctx, uint64_t lpn)
     s->pinning = false;
 }
 
+/* BI snoop-equivalent latency (ns) charged in the tail-page trap path
+ * (cxlssd.c). Written by the PNM thread from the live knob per job; 0 =
+ * off = E1'-identical behavior. */
+uint64_t cylon_bi_lat_ns;
+
+/* Re-trap a tail control page at job completion (D1 BI bill). pin_tail_page
+ * made these pages direct forever; the BI semantic needs the client's next
+ * pickup read to EXIT into FEMU so the snoop-equivalent latency can be
+ * charged before flipping back. Tail flips are exactly what the set_trap
+ * tripwire watches for, so write the leaf here directly. Must flush vCPU
+ * EPT TLBs or a vCPU holding the cached direct translation never exits
+ * and the bill is silently skipped (FEMU_DER_FLUSH=0 disables this too). */
+void der_kvm_epte_retrap_control(Cxlssd *ctx, uint64_t lpn)
+{
+    DerKvmState *s = ctx ? ctx->der_kvm : NULL;
+    uint64_t gfn;
+    u64 *eptep;
+
+    if (!s || !s->init_done || s->plain) {
+        return;
+    }
+    if (lpn + DER_TAIL_PIN_PAGES < (s->memory_size >> 12)) {
+        return;     /* not a tail page */
+    }
+    gfn = (s->guest_phys_addr >> PAGE_SHIFT) + lpn;
+    eptep = get_eptep(s, lpn);
+    if (eptep) {
+        *eptep = (gfn << PAGE_SHIFT) | MMIO_MASK;
+        der_kvm_flush_tlbs(ctx, true);
+    }
+}
+
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
 {
     DerKvmState *s = ctx ? ctx->der_kvm : NULL;

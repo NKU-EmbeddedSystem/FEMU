@@ -53,6 +53,7 @@ policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
 prf_dg=0 # Next-n Prefetch degree
 der_flush=1 # FEMU_DER_FLUSH [0:off 1:guest-origin misses only 2:always=collab]
 comp_dly=0 # engine per-dist compute ns (device compute knob; live-tunable: /tmp/femu-compute-ns)
+bi_lat=0 # D1 Type-2 BI snoop ns (CXL.cache coherence bill; live-tunable: /tmp/femu-bi-lat-ns; 0 = Type-3 off)
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
@@ -145,6 +146,7 @@ dram_size=16G
 
 echo "$der_flush" > /tmp/femu-der-flush
 echo "$comp_dly" > /tmp/femu-compute-ns
+echo "$bi_lat" > /tmp/femu-bi-lat-ns
 sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \

@@ -384,6 +384,24 @@ static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c, unsigned size
 int cnt = 0;
 char str[128];
 uint64_t prev = 0;
+/* D1 Type-2 BI bill: a guest access that traps into a window-tail control
+ * page after an engine job completion is the CXL.cache snoop-equivalent —
+ * the device pulling the line to generate the response. Charge the
+ * snoop-equivalent latency per cacheline from the live knob
+ * (cylon_bi_lat_ns, written by the PNM thread at each job completion);
+ * 0 = off. Traps here also self-pin the page direct (pin_tail_page), so a
+ * pickup sequence is billed once per page per job cycle. */
+static void cylon_bi_charge(uint64_t addr, unsigned size)
+{
+    if (cylon_bi_lat_ns) {
+        uint64_t target = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                          cylon_bi_lat_ns * ((size + 63) / 64);
+        while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < target) {
+            /* spin */
+        }
+    }
+}
+
 static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, unsigned size, MemTxAttrs attrs)
 {
     FemuCtrl *n = (FemuCtrl *)opaque;
@@ -407,6 +425,7 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     if (n->mbe->size - addr <= (uint64_t)DER_TAIL_PIN_PAGES * 4096) {
         Cxlssd *ctx = cxlssd_ctx_from_ctrl(n);
         der_kvm_pin_tail_page(ctx, addr >> 12);
+        cylon_bi_charge(addr, size);
         memcpy(data, (const char *)n->mbe->logical_space + addr, size);
         return MEMTX_OK;
     }
@@ -435,6 +454,7 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
     if (n->mbe->size - addr <= (uint64_t)DER_TAIL_PIN_PAGES * 4096) {
         Cxlssd *ctx = cxlssd_ctx_from_ctrl(n);
         der_kvm_pin_tail_page(ctx, addr >> 12);
+        cylon_bi_charge(addr, size);
         memcpy((char *)n->mbe->logical_space + addr, &data, size);
         return MEMTX_OK;
     }

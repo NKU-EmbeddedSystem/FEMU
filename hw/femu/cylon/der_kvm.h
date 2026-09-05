@@ -68,6 +68,15 @@ int der_kvm_flush_tlbs(Cxlssd *ctx, bool guest);
 /* Pin a window-tail control page direct to logical_space (call from the
  * trap path — see der_kvm.c). Never cachable, never flipped again. */
 void der_kvm_pin_tail_page(Cxlssd *ctx, uint64_t lpn);
+/* D1 Type-2 BI bill: re-trap a tail control page (mailbox/results) at job
+ * completion so the client's next pickup read takes an EPT violation; the
+ * trap path charges the snoop-equivalent latency (cylon_bi_lat_ns). Needs
+ * a vCPU EPT TLB flush or clients with a cached direct translation never
+ * see the trap (silently no-op'd in plain mode / before init). */
+void der_kvm_epte_retrap_control(Cxlssd *ctx, uint64_t lpn);
+/* BI snoop-equivalent latency (ns), 0 = off. Defined in der_kvm.c, written
+ * by the PNM thread (live knob), charged in cxlssd.c's tail-page trap path. */
+extern uint64_t cylon_bi_lat_ns;
 uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn);
 
 int der_kvm_set_user_memory_region(const FemuCtrl *n);
