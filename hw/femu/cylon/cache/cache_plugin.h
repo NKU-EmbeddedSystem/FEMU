@@ -12,7 +12,7 @@ typedef struct cache_ops {
     struct cache_entry *(*lookup)(void *cache_data, lpn_t lpn);
     void (*set_dirty)(struct cache_entry *e, bool dirty);
     bool (*is_dirty)(struct cache_entry *e);
-    void (*insert)(void *cache_data, struct cache_entry *e, int prefetch);
+    void (*insert)(void *cache_data, struct cache_entry *e, int prefetch, bool guest);
     struct cache_entry *(*entry_init)(void *cache_data, lpn_t lpn);
     uint32_t (*get_slot_id)(struct cache_entry *e);
 } cache_ops_t;

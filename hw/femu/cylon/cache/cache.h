@@ -83,7 +83,7 @@ Cache *cache_create(struct ssd *ssd, int policy_id, int size, CacheWay way);
 void cache_destroy(Cache *c);
 
 CacheEntry *cache_lookup(Cache *c, lpn_t lpn);
-int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch);
+int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest);
 
 /* Cold reset for experiment re-runs on a live FEMU: flush every resident
  * slot back to NAND, drop all entries via the policy's own evict path,

@@ -277,7 +277,7 @@ static void pnm_graph_read(struct pnm_state *st, uint64_t off, void *dst, uint32
             if (slot == UINT32_MAX) {
                 struct cache_plugin *cp = ctx->cache;
                 struct cache_entry *e = cp->ops.entry_init(cp->cache_data, lpn);
-                cp->ops.insert(cp->cache_data, e, 0);
+                cp->ops.insert(cp->cache_data, e, 0, false);
                 slot = cylon_cache_lookup_slot(cp->cache_data, lpn);
                 st->job_misses++;
                 st->job_miss_ns += (uint64_t)n->bb_params.pg_rd_lat;
@@ -601,6 +601,31 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
             float d = pnm_dist(st, nb);
             n_dist++;
             pnm_visit(st, &cand_n, &res_n, nb, d, ef);
+        }
+    }
+
+    /* modeled device compute capability: the PNM dist array charges
+     * compute-ns per distance, settled as a busy-wait at job end (the
+     * "compute array beside the cache, controller core free" model;
+     * serial-adds to the miss burn below, the conservative non-overlapped
+     * model). Read from /tmp/femu-compute-ns per job so calibration sweeps
+     * tune it live without a restart; absent/0 = unthrottled (the engine
+     * that produced all E1/E2 baselines). Real CXL SSD controllers
+     * (~1-2 ARM cores) sit at ~1-10us/dist = 1/4-1/10 of a server core,
+     * so the sweep anchors the device-compute axis for the paper. */
+    uint64_t comp_ns = 0;
+    FILE *cf = fopen("/tmp/femu-compute-ns", "r");
+    if (cf) {
+        char cb[32] = {0};
+        if (fgets(cb, sizeof(cb), cf)) {
+            comp_ns = strtoull(cb, 0, 0);
+        }
+        fclose(cf);
+    }
+    if (comp_ns) {
+        uint64_t ctarget = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                           n_dist * comp_ns;
+        while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < ctarget) {
         }
     }
 

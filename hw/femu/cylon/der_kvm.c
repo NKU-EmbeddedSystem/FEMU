@@ -180,6 +180,63 @@ int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn)
     return -1;
 }
 
+/* Invalidate all vCPU EPT TLB entries after leaf rewrites. The flip helpers
+ * above write the shared leaves directly from userspace, so KVM never learns
+ * the EPTE changed — a vCPU whose TLB still caches a page's old direct
+ * translation keeps reading the OLD slot's content after eviction/reinsert
+ * (host-side cache reads bypass EPT and are unaffected; guest window readers
+ * like cpu_search hit this). Requires the CylonLinux KVM_DER_FLUSH_TLB ioctl
+ * (0xdf); on kernels without it we warn once and keep the old behavior.
+ * FEMU_DER_FLUSH=0 disables. */
+int der_kvm_flush_tlbs(Cxlssd *ctx, bool guest)
+{
+    DerKvmState *s = ctx ? ctx->der_kvm : NULL;
+    static int mode = -1;
+    int ret;
+
+    if (!s || s->plain) {
+        return 0;
+    }
+    if (mode < 0) {
+        const char *e = getenv("FEMU_DER_FLUSH");
+        if (!e) {
+            /* sudo scrubs env: run-cxlssd.sh publishes the mode via this
+             * sentinel file instead (same pattern as /tmp/femu-der-disable) */
+            FILE *f = fopen("/tmp/femu-der-flush", "r");
+            if (f) {
+                char buf[16] = { 0 };
+                if (fgets(buf, sizeof(buf), f)) {
+                    e = buf;
+                }
+                fclose(f);
+            }
+        }
+        mode = e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2) {
+            mode = 1;
+        }
+    }
+    /* 0 = off; 1 = guest-origin misses only (engine reads bypass EPT, so
+     * their evictions can skip the flush — keeps the engine miss model
+     * free of this host-only IPI overhead); 2 = always */
+    if (mode == 0 || (mode == 1 && !guest)) {
+        return 0;
+    }
+    ret = kvm_vm_ioctl(kvm_state, KVM_DER_FLUSH_TLB, 0);
+    if (ret < 0) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "Cylon DER-KVM: KVM_DER_FLUSH_TLB unavailable "
+                    "(ret=%d errno=%d) — stale EPT TLB after evictions WILL "
+                    "corrupt guest window reads (host-side reads unaffected)\n",
+                    ret, errno);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa)
 {
     DerKvmState *s = ctx ? ctx->der_kvm : NULL;

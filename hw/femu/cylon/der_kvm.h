@@ -56,9 +56,15 @@ typedef struct DerKvmState {
 
 #define KVM_SET_EPTE_FLAG		  _IOW(KVMIO, 0xdd, struct kvm_set_epte_flag)
 #define KVM_GET_LINEAR_EPT		  _IOWR(KVMIO, 0xde, struct kvm_memslot_get_linear_ept)
+#define KVM_DER_FLUSH_TLB		  _IO(KVMIO, 0xdf)
 
 int der_kvm_epte_set_trap(Cxlssd *ctx, uint64_t lpn);
 int der_kvm_epte_set_driect(Cxlssd *ctx, uint64_t lpn, uint64_t hpa);
+/* Invalidate vCPU EPT TLBs after leaf rewrites (evictions). Mode via
+ * FEMU_DER_FLUSH: 0 = off, 1 (default) = flush on guest-origin misses only,
+ * 2 = always. Kernels without the KVM_DER_FLUSH_TLB ioctl log once and
+ * behave like the old flush-less code. */
+int der_kvm_flush_tlbs(Cxlssd *ctx, bool guest);
 /* Pin a window-tail control page direct to logical_space (call from the
  * trap path — see der_kvm.c). Never cachable, never flipped again. */
 void der_kvm_pin_tail_page(Cxlssd *ctx, uint64_t lpn);

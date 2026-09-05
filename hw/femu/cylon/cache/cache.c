@@ -301,7 +301,7 @@ uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn)
 }
 
 /* High-level insert: eviction (epte_set_trap + flush), memcpy, epte_set_direct, then policy insert */
-int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
+int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest)
 {
     struct ssd *ssd = cache_get_ssd(c);
     Cxlssd *ctx = cxlssd_ctx_from_ssd(ssd);
@@ -310,6 +310,7 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
     int ent_max = (way == CACHE_WAY_FULL) ? cache_get_size(c) : (1 << way);
     CacheEntry key = { .lpn = entry->lpn };
     int rc;
+    bool evicted = false;
 
     (void)prefetch;
 
@@ -373,6 +374,20 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch)
         c->stats.evict_count++;
         entry->slot_id = victim->slot_id;
         cache_entry_free(victim);
+        evicted = true;
+    }
+
+    /* Every eviction broke a live direct translation (leaf rewritten via the
+     * userspace alias, invisible to KVM). Flush the vCPU EPT TLBs BEFORE the
+     * freed slot is refilled below, so a stale read of the victim page traps
+     * into the (correct) FTL path instead of silently returning the new
+     * occupant's data. Guest-origin misses must flush (the vCPU reads the
+     * window through these EPTEs); engine-origin misses can skip the flush —
+     * host-side cache reads bypass EPT, so the DSE miss model (misses x
+     * pg_rd_lat) stays free of this host-only IPI artifact (FEMU_DER_FLUSH=2
+     * forces always-on, e.g. for collaborative CPU+engine runs). */
+    if (evicted) {
+        der_kvm_flush_tlbs(ctx, guest);
     }
 
     if (entry->slot_id == UINT32_MAX && c->cache_buf && c->nr_slots > 0) {
@@ -452,6 +467,10 @@ void cylon_cache_reset(Cache *c)
     }
     c->free_top = c->nr_slots;
     qemu_mutex_unlock(&c->lock);
+
+    /* all window leaves were just re-trapped: flush any stale direct
+     * translations so post-FLUSH guest reads walk into the FTL path */
+    der_kvm_flush_tlbs(ctx, true);
 }
 
 /* ---- Plugin ops (cache_ops_t: void *cache_data, struct cache_entry *) ---- */
@@ -474,10 +493,11 @@ static bool plugin_is_dirty(struct cache_entry *e)
     return e ? ((CacheEntry *)e)->dirty : false;
 }
 
-static void plugin_insert(void *cache_data, struct cache_entry *e, int prefetch)
+static void plugin_insert(void *cache_data, struct cache_entry *e, int prefetch,
+                          bool guest)
 {
     Cache *c = (Cache *)cache_data;
-    cylon_cache_insert(c, (CacheEntry *)e, prefetch);
+    cylon_cache_insert(c, (CacheEntry *)e, prefetch, guest);
 }
 
 static struct cache_entry *plugin_entry_init(void *cache_data, lpn_t lpn)

@@ -11,10 +11,10 @@ IVSHMEM_DEV=/dev/shm/ivshmem0
 IVSHMEM_DEV_ID=ivshmem0
 IVSHMEM_SIZE=1M
 if [ ! -e "$IVSHMEM_DEV" ]; then
-    sudo mkdir -p /dev/shm
-    sudo chmod 777 /dev/shm
+    sudo -n mkdir -p /dev/shm
+    sudo -n chmod 777 /dev/shm
     dd if=/dev/zero of=$IVSHMEM_DEV bs=$IVSHMEM_SIZE count=1
-    sudo chmod 666 $IVSHMEM_DEV
+    sudo -n chmod 666 $IVSHMEM_DEV
 fi
 
 
@@ -51,12 +51,14 @@ cache_hpa_base=0x2000000000
 # CXL-SSD DRAM buffer parameters
 policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
 prf_dg=0 # Next-n Prefetch degree
+der_flush=1 # FEMU_DER_FLUSH [0:off 1:guest-origin misses only 2:always=collab]
+comp_dly=0 # engine per-dist compute ns (device compute knob; live-tunable: /tmp/femu-compute-ns)
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
 # DSE sweep: cache size vs 495MB SIFT1M index (512 = full residency,
 # 256/128/64 = partial -> search-time misses pay NAND latency)
-bufsz=256
+bufsz=512
 # bufsz=$((ssd_size/20))
 # skip_ftl=1: guest window accesses bypass the FTL ring/cache and memcpy
 # directly into logical_space (correctness/acceptance mode).
@@ -134,14 +136,16 @@ echo ${FEMU_OPTIONS}
 
 nr_hugepages=$((ssd_size/2))
 
-echo 0 | sudo tee /proc/sys/kernel/numa_balancing
-# echo $nr_hugepages | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
-echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+echo 0 | sudo -n tee /proc/sys/kernel/numa_balancing
+# echo $nr_hugepages | sudo -n tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+echo never | sudo -n tee /sys/kernel/mm/transparent_hugepage/enabled
 
 n_threads=8
 dram_size=16G
 
-sudo /home/liz/FEMU/build/qemu-system-x86_64 \
+echo "$der_flush" > /tmp/femu-der-flush
+echo "$comp_dly" > /tmp/femu-compute-ns
+sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
     -cpu host \

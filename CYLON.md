@@ -133,6 +133,79 @@ Guest ld/st (CXL 窗口 GPA)
   中没有 0xdd/0xde 这两个 ioctl（已实测确认），未打补丁的内核上会在设备初始化时
   `perror` 后直接 `abort()`（cxlssd.c: `der_kvm_set_user_memory_region() != 0 -> abort()`）。
 
+#### 3.3.1 为什么会发生 leaf 改写，以及 TLB 一致性这个洞（2026-09-04 定案）
+
+**改写的触发者是设备模型自己，但改写的对象不是设备内部数据，而是 guest 的 EPT leaf——
+一张 guest 摸不到的"地址路牌"。** 把"搬数据"和"换路牌"分开，机制就清楚了：
+
+| 事件 | 触发者 | leaf 改写 |
+|---|---|---|
+| 页回填（staging、guest 读 miss、引擎 host 读 miss） | FTL 线程（消费 guest trap 出来的 cxl_req）或 PNM 引擎线程（直接调 cache API） | trap → direct：`gfn(这页) → 缓存 slot 的 HPA` |
+| 缓存满驱逐 | 同上，任何插入都可能赶走别人 | direct → trap：`gfn(受害者) → MMIO 陷阱` |
+
+只往 slot memcpy 不改 leaf，guest 永远感知不到缓存存在；改 leaf 才是把驻留状态
+**发布**给 guest 访问路径的动作。双层视图：
+
+```
+guest 视角（一无所知）:   虚拟地址 ──guest页表──> GPA（"设备内存"，恒等映射，从不变）
+
+hypervisor 层（EPT，guest 看不见）:
+   GPA + 页P ──┬─ leaf=direct → slot 的 HPA（设备缓存 DRAM）→ 访存即命中，~1µs 不退出
+               └─ leaf=trap  → EPT violation → 退出到 QEMU → cxlssd_mem_read → FTL：
+                                读"NAND"（40µs 计费）→ 填 slot → leaf 翻回 direct
+```
+
+这就是 DER 的卖点：**透明**——guest 零驱动零感知，快/慢全由设备单方面决定，
+发布渠道只能是 EPT 这张 guest 软件摸不到的表。"guest 不知道"分两层：
+
+1. **guest 软件不知道（by design）**：驻留状态是设备内部实现细节。这是特性。
+2. **guest 所在 CPU 的 MMU 缓存也不知道（by accident）**：leaf 是普通内存，QEMU 通过
+   `KVM_GET_LINEAR_EPT` 的共享映射直接写它，**KVM 全程不感知**，自然也没人发 INVEPT；
+   而 EPT TLB 缓存的是"翻译结果"，硬件不会侦听 leaf 页内容变化——**路牌换了，肌肉记忆还在**。
+   这是 bug：驱逐后 slot 复用填新数据，vCPU TLB 里陈旧的 direct 翻译仍把 victim 页
+   指到旧 slot，guest 读到的是**别的页的数据**。
+
+为什么引擎侧实验（DSE 四点）从来没中招：引擎读图是 QEMU 线程 host 侧直读 slot，
+根本不过 EPT；信箱/结果区在尾页且自钉；Phase A 的 guest 读只碰尾页。**cpu_search 是
+第一个让 guest vCPU 大批量直读可驱逐窗口页的负载**，第二层"不知道"才第一次被踩到
+（签名：确定性错位——同配置下 query0 第 3 名恒为同一个错误 id；512M 全驻留也中招，
+因为 staging 期 set 溢出驱逐照样造 stale 项，搜索期 0 miss 永无翻案机会）。
+
+**修复为什么必须动内核**：INVEPT 是特权指令，用户态的 FEMU 物理上冲不了 vCPU 的
+EPT TLB，只有 KVM 能发。现有用户态可达的全量 flush 路径全不适用：mmu-notifier
+invalidate 要求真的 munmap 一段有活 EPT 映射的内存（得造 dummy memslot 还得骗 guest
+先碰它）；`KVM_RESET_DIRTY_PAGES` 要求 VM 创建时开 dirty ring（全局副作用）；重调
+`KVM_GET_LINEAR_EPT` 只 remap 无 flush；memslot 增删只 flush 该 slot 自己的 GFN 范围。
+于是加专用 ioctl（本机补丁，deb **6.4.6-9** 起）：
+
+```c
+// CylonLinux include/linux/kvm_ext.h（0xde 被 GET_LINEAR_SPT 占，顺位 0xdf）
+#define KVM_DER_FLUSH_TLB  _IO(KVMIO, 0xdf)
+// virt/kvm/kvm_main.c kvm_vm_ioctl:
+case KVM_DER_FLUSH_TLB: kvm_flush_remote_tlbs(kvm); r = 0; break;
+```
+
+FEMU 侧 `der_kvm_flush_tlbs(ctx, guest)`，调用点与顺序（顺序即正确性）：
+
+- `cylon_cache_insert`：驱逐翻 trap 之后、slot 复用 fill **之前** flush——先 flush 再复用，
+  读 victim 的陈旧翻译会落入 trap → 走正确的 FTL 路径；反过来就有一个能读到新房客
+  数据的窗口；
+- `cylon_cache_reset`（FLUSH op）尾部 flush；
+- `FEMU_DER_FLUSH`：`0`=关 / `1`(默认)=仅 guest 发起的 miss flush——引擎 miss 不 flush，
+  host 读不经 EPT，DSE 引擎的 miss×40µs 模型保持零 IPI 污染 / `2`=全开（CPU+引擎
+  collab 模式必用：引擎驱逐同样会毒化并发 guest 读者）；
+- 旧内核上新 FEMU：ENOTTY 警告一次后行为同旧版（已实测）。
+
+一句话：**DER 的"改页表"通道天然绕过了 KVM，缺一条"通知 KVM 冲 TLB"的回头路，
+`KVM_DER_FLUSH_TLB` 就是这条回头路**。没有它，guest 侧直读窗口数据的一切实验
+（CPU-baseline、协同模式）都建立在被毒化的读上，而引擎侧实验恰好看不见这个坑。
+
+> **2026-09-04 定案附记**：cpu_search 在 512M 全驻留下的确定性错位后来查明**不是** stale TLB
+> （全驻留零 flip，本无翻案场景），而是 cpu_search.c 相对 engref.c 的一处转录 bug——res
+> max-heap `heap_pop_max` 的 siftdown 比较符写反，堆顶假 worst 使遍历提前 break（一字符之差，
+> 定位靠 hop 级 trace + 遍历核心函数级 diff）。stale-TLB 洞本身真实存在、flush 修复真实有效，
+> 但只作用在有真驱逐的容量点（<全驻留）。教训：确定性错位+早停，先 diff 遍历代码，再怀疑环境。
+
 ### 3.4 设备内 DRAM 缓存（hw/femu/cylon/cache/）
 
 - `cache_backend.h`：缓存槽位缓冲区。若设置了 `cache_backend_dev`（`/dev/cmahog`）则
@@ -144,7 +217,8 @@ Guest ld/st (CXL 窗口 GPA)
 - `policy/`：策略插件注册表 + 四种实现（lifo.c / fifo.c / clock.c / s3fifo.c），
   ID 由 femu.h 枚举决定：`NONE=0, LIFO=1, FIFO=2, CLOCK=3, S3FIFO=4`。
   策略只负责选 victim/维护元数据；数据拷贝与 EPTE 切换统一在 cache.c 的
-  "evict(epte_set_trap+回写) -> memcpy -> epte_set_direct -> policy insert" 流程里。
+  "evict(epte_set_trap+回写) -> [flush TLB] -> memcpy -> epte_set_direct -> policy insert"
+  流程里（2026-09-04 起驱逐后多一步 `der_kvm_flush_tlbs`，见 §3.3.1）。
 - `prf_dg`（`prefetch_degree`）：miss 插入时顺带预取后续 N 页（INSERT_PREFETCH 路径）。
 
 ### 3.5 NVMe 路径（并存）

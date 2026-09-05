@@ -103,7 +103,7 @@ void *ftl_thread_cxlssd(void *arg)
             if (centry) {
                 ctx->cache->ops.set_dirty(centry,
                     (ctx->cache->ops.is_dirty(centry) || !read));
-                ctx->cache->ops.insert(ctx->cache->cache_data, centry, INSERT_NO_PREFETCH);
+                ctx->cache->ops.insert(ctx->cache->cache_data, centry, INSERT_NO_PREFETCH, true);
             } else {
                 struct nand_cmd ncmd = {
                     .type = USER_IO,
@@ -130,7 +130,7 @@ void *ftl_thread_cxlssd(void *arg)
                     lat += ssd_advance_status(ssd, &new_ppa, &ncmd);
                 }
                 creq->expire_time += lat;
-                ctx->cache->ops.insert(ctx->cache->cache_data, centry, INSERT_PREFETCH);
+                ctx->cache->ops.insert(ctx->cache->cache_data, centry, INSERT_PREFETCH, true);
             }
 
             /* Memory operation: copy between cache backend slot and guest (data_ptr).
