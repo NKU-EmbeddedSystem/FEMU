@@ -567,6 +567,37 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
   占用，干扰画像需重测）在选定工作点（推荐 v=1000）重跑。
 
 
+### 8.9.8 真实器件锚定 = 模拟器典型默认配置（2026-09-05）
+
+**器件画像（调研锚定）**：引擎 = **FP16 数 Tflops 脉动阵列**；引擎外接 SSD =
+**PCIe4.0 x8**。此画像即模拟器的典型默认配置（E1' 及此前全部实验实际就是在它下面
+测的——`comp_dly=0`、`pg_rd_lat=40µs` 本就是开机默认）。
+
+**算力轴推导**：一条 dist = 768d fp16 点积 = 768 FMA = 1536 FLOP：
+
+| 阵列算力 | per-dist | 每 query（4706 dist） | 占 exec（208ms） |
+|---|---|---|---|
+| 2 TFLOPS | 0.77 ns | 3.6 µs | 0.002% |
+| 4 TFLOPS | 0.38 ns | 1.8 µs | 0.001% |
+| 8 TFLOPS | 0.19 ns | 0.9 µs | ~0% |
+
+→ 全部低于 `comp_dly` 的 1ns 粒度，且 ~0.001% of job wall（**闪存 miss 延迟绝对主导**）。
+**典型默认 `comp_dly=0` 即忠实配置**。§8.9.7 的"推荐 v=1000"基于旧"1-2×ARM 控制器"
+假设——FPGA 画像下**不再是默认**，降级为论文的"弱控制器"轴（E0 扫描保留）。
+
+补充：未阉割引擎是宿主软件代码（~340ns/dist @768d），比脉动阵列慢 ~1000×，但同样只占
+exec 0.8%——所以 0 默认既忠实又已被 E1' 实测覆盖。
+
+**PCIe4.0 x8 SSD 轴**：`pg_rd_lat=40µs`（Gen4 NVMe QD1 读延迟典型 20-100µs，取中）、
+`pg_wr_lat=200µs`（TLC+FTL）、erase 2ms。带宽 x8 ≈ 15.75GB/s 原始 / ~14GB/s 有效，而
+引擎 miss 流是串行的（一次一页，4KB/48µs ≈ 85MB/s）= 链路的 0.6% → **带宽永不 bind，
+DER 延迟-only 记费忠实**（`ch_xfer_lat=0` 保持）。驻留数据经 CXL.mem 窗口 DRAM 直达，
+与该链路无关。
+
+**落位**：`run-cxlssd.sh` 注释锚定（comp_dly / pg_rd_lat / pg_wr_lat 处）；纯注释改动，
+无需重建。
+
+
 ## 8.10 Phase C：21M×768d 真实语料规模验证（2026-09-05 完成 E1'）
 
 ### 8.10.1 数据集与建图
@@ -603,6 +634,9 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
   host engref（114.4）一致。
 - **验收：7/7 点 dump 与 engref 参考逐字节一致，recall@10 全部 0.9720**——与 Phase A
   （1M SIFT, 0.9896）同等强度。
+- **论文图三件套**：`/var/tmp/cylon/anns/exp/e1c_paper/`（`e1c_results.csv` 全点位数据
+  含理想模型列 + `plot_e1c.py` → `e1c_qps_vs_f.png`：QPS-f 曲线 + wall 分解双面板，
+  峰值实测 = 理想模型的 96%）。
 
 ### 8.10.3 运行时内存墙与部署坑（两次返工换来）
 - **运行时 RSS ≈ 设备容量 + guest 16GB DRAM + ~3GB 开销**。96GB 设备 + 16GB = 115GB
@@ -616,10 +650,15 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
   并中止，不再被管道 `|| true` 静默吞掉。
 
 ### 8.10.4 已知问题（不阻塞，待查）
-- **collab avx 客户端低频竞态**：每 sweep ~1/7 概率、点位随机，客户端 GPF 野跳转
-  （dmesg `general protection fault`，ip 落在指令流中间 = 控制流被踩）。引擎侧无恙
-  （把已提交 job 做完即空闲），下一点正常恢复；已完成点不受影响（逐字节门禁保证）。
-  处置 = 该点重试即可；根因（邮箱并发路径内存污染）待专项排查。
+- **collab 低频竞态（邮箱并发路径内存污染，根因待查）**：~每 sweep 1/7 概率、点位随机，
+  **客户端或 FEMU 随机中签**。客户端中签 = GPF 野跳转（dmesg `general protection fault`，
+  ip 落指令流中间），该点重试即可。**FEMU 中签（2026-09-05 11:03 首次实测，compute
+  sensitivity sweep v=1 期间）= qemu 本体 GPF 直接死亡**（`traps: qemu-system-x86 ...
+  error:0`，ip 段内偏移 0x184c80 未解析到符号）→ guest 一并失联，需完整重启流程
+  （`femu-restart.sh 49152` + guest 起后 `cxl create-region`/`daxctl devdax` 窗口初始化
+  + 客户端重编）。已完成点不受影响（逐字节门禁保证）；sweep 包装已加 FEMU 存活 guard
+  （中签即停，不空转）。guest 重启后 blob 为 clean page cache，无需重推，首个成功点的
+  dump 逐字节门禁即完整性验收。
 - verify-window 恒报 `1 pages differ [p9239448]`：queries 区尾页口径差（staging 写满
   页 vs verify 按文件 EOF 截断），搜索实际读的字节正确（全部 dump 逐字节一致），暂不修。
 

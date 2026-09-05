@@ -52,7 +52,12 @@ cache_hpa_base=0x2000000000
 policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
 prf_dg=0 # Next-n Prefetch degree
 der_flush=1 # FEMU_DER_FLUSH [0:off 1:guest-origin misses only 2:always=collab]
-comp_dly=0 # engine per-dist compute ns (device compute knob; live-tunable: /tmp/femu-compute-ns)
+# Device profile anchor (2026-09-05): engine = FP16 multi-TFLOP systolic
+# array. One 768d dist = 1536 FLOP = 0.2-0.8ns -> below the 1ns knob
+# granularity, ~0.001% of job wall (flash misses dominate). comp_dly=0 is
+# therefore the faithful typical default; the knob stays for weak-controller
+# sweeps (CYLON-USAGE.md 8.9.7/8.9.8).
+comp_dly=0 # engine per-dist compute ns (live-tunable: /tmp/femu-compute-ns)
 
 # Configurable SSD Controller layout parameters (must be power of 2)
 ssd_size=$1		# in MegaBytes
@@ -92,7 +97,11 @@ then
 fi
 
 
-# Latency in nanoseconds
+# Latency in nanoseconds. Anchored to a PCIe4.0 x8 NVMe-class SSD (the
+# engine-attached flash; 2026-09-05 device profile): 4KB read ~40us
+# (Gen4 NVMe QD1 20-100us), write ~200us (TLC+FTL), erase 2ms. x8 BW
+# ~14GB/s is 160x the worst-case serialized miss stream (~85MB/s), so
+# bandwidth never binds and latency-only charging is faithful.
 pg_rd_lat=40000
 pg_wr_lat=200000
 blk_er_lat=2000000
