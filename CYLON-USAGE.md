@@ -327,6 +327,14 @@ Phase A 引擎 BIND 时把整份索引快照进本地内存（local copy）；Ph
 - **staging 时序三分法**（495MB = 126,720 页，判读重跑健康度）：
   **~26.5s** = 208µs/页 NAND program 计费（FTL map 空，冷启动首轮）｜**~6s** = 47µs/页 read 计费
   （map 已映射，FLUSH 后重跑的**正常值**）｜**~3.2s** = 零计费 bypass（**坏签名**）。
+- **D2 设备发起 staging（`PNM_OP_STAGE=4`，2026-09-06 实现，见 CYLON-TYPE2.md §4）**：
+  客户端 `--stage=dev`（cpu_search 与 pnm_client 同款；wiki_exp.sh 第 4 参 `ft|dev`）。引擎把
+  mapped 页从介质批量重填 512MB 缓存（lpn 升序 = first-touch 同序 → 终态逐位同），按
+  `/tmp/femu-stage-bps` 计费（**缺省 2GB/s 计费、文件存在且 0 = 不计费**——有意区别于其他
+  /tmp 旋钮 absent=off）。wiki 36GB 时序四分法：**~60s** = 真实填充下限（knob=0）｜**~18.4s**
+  = 2GB/s 计费（缺省操作点）｜**~2.6s** = 14GB/s｜**33min/542s** = first-touch（fresh boot
+  回退路径覆盖 0 → 自动 FLUSH + stage_file，客户端日志 `falling back to first-touch`）。
+  覆盖数 = resp.n_found；老引擎 ENOSYS → 回退；超时不回退（引擎 mid-job）。
 - **canonical tie-break**：~14% 查询 top-10 含相邻等距对，裸 qsort tie 序随堆内序漂移 →
   `pnm.c pnm_cmp_asc` 与 `engref.c pnm_cnd_asc` 都按 (d, id) 排序。**engref 参考已重生成**
   （2026-09-04，recall 0.9896→0.9898；旧 dump 系早期 engref 二进制产物，备份 .pre-tiebreak）。
@@ -642,6 +650,7 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
 | `cxl create-region` 报 ENXIO | guest 内核缺 `CXL_REGION_INVALIDATION_TEST`/`CXL_MEM_RAW_COMMANDS`（-3 起 deb 已含） |
 | devdax mmap EINVAL "vma is not DAX capable" | guest 内核缺 `FS_DAX`（-4 起 deb 已含） |
 | setup_cxl.sh 报 libdaxctl/libndctl 缺失 | 用 `sudo env LD_LIBRARY_PATH=/usr/lib /usr/local/bin/setup_cxl.sh …` |
+| FEMU/guest 重启后客户端 `open /dev/dax0.0: No such file or directory` | guest 每次重启后需重建 devdax 节点：`sudo env LD_LIBRARY_PATH=/usr/lib /usr/local/bin/setup_cxl.sh devdax`（2026-09-06，D2 验证首跑即中） |
 | QEMU 卡死诊断 | QMP socket 是 root-only：`sudo python3 /tmp/qmp_diag.py`（查 vCPU 状态+寄存器）；Ctrl-A C 在主循环持 BQL 时无响应 |
 | FEMU 端口/进程 | `pgrep -af qemu-system-x86 | grep -v grep`（pgrep -f 带子串会自匹配） |
 

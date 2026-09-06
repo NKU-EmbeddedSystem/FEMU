@@ -27,6 +27,15 @@
                                  * entry, re-trap every window EPTE. Issue
                                  * before staging so a re-run on a live FEMU
                                  * doesn't stage through stale direct EPTEs */
+#define PNM_OP_STAGE        4   /* device-initiated staging (D2, FTL-prefetch):
+                                 * a0 = blob byte count; the engine bulk-fills
+                                 * cache slots from its own media (mapped pages
+                                 * in [0, a0)) at modeled bulk bandwidth
+                                 * /tmp/femu-stage-bps (absent = 2 GB/s, 0 =
+                                 * unbilled). a1 must be 0. Coverage lands in
+                                 * resp.n_found; skipped pages in resp.n_pages.
+                                 * Engine older than this op answers ENOSYS ->
+                                 * client falls back to legacy first-touch. */
 
 /* status codes */
 #define PNM_ST_OK           0

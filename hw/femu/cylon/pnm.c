@@ -178,6 +178,7 @@ struct pnm_state {
     uint64_t job_ns, job_dist, job_hops, job_pages;
     uint64_t job_misses, job_miss_ns;   /* search-time cache misses + charge */
     uint32_t job_found;
+    uint32_t job_staged;         /* STAGE: pages bulk-filled (resp.reserved) */
 };
 
 /* cache-aware translation: hit -> pmem cache slice, miss -> logical_space */
@@ -316,6 +317,105 @@ static int pnm_handle_flush(struct pnm_state *st)
     if (ctx->cache && ctx->cache->cache_data) {
         cylon_cache_reset((Cache *)ctx->cache->cache_data);
     }
+    return PNM_ST_OK;
+}
+
+/* STAGE (D2, FTL-prefetch): device-initiated staging. The client submits one
+ * job with a0 = blob byte count; the engine bulk-fills cache slots from its
+ * own media (logical_space) instead of the guest pushing 36GB through
+ * per-page trap billing (33min cold / 9min restage). Only maptbl-mapped pages
+ * are staged — unmapped means no committed data; the client detects the
+ * coverage shortfall and falls back to legacy first-touch (once per FEMU
+ * boot). Clean entries in ascending lpn order: search-visible state is
+ * identical to first-touch staging, so the dump byte-identity gate holds
+ * structurally. Billing is a modeled bulk bandwidth, /tmp/femu-stage-bps:
+ * ABSENT = 2 GB/s default, 0 = unbilled (deliberately unlike the other /tmp
+ * knobs, where absent = off — here absent-off would make the default path
+ * silently free). */
+static int pnm_handle_stage(struct pnm_state *st, uint32_t job_id, uint64_t a0)
+{
+    Cxlssd *ctx = st->ctx;
+    FemuCtrl *n = st->n;
+    struct cache_plugin *cp = ctx->cache;
+    struct ssd *ssd = n->ssd;
+
+    if (!cp || !cp->cache_data || a0 == 0) {
+        return PNM_ST_EINVAL;
+    }
+    if (a0 > (uint64_t)n->mbe->size - PNM_MB_OFF_FROM_END) {
+        return PNM_ST_EINVAL;
+    }
+
+    uint64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* modeled bulk-read bandwidth, read once per job */
+    uint64_t bps = 2000000000ull;   /* knob absent -> 2 GB/s modeled */
+    FILE *sf = fopen("/tmp/femu-stage-bps", "r");
+    if (sf) {
+        char sb[32] = { 0 };
+        if (fgets(sb, sizeof(sb), sf)) {
+            bps = strtoull(sb, 0, 0);
+        }
+        fclose(sf);
+    }
+
+    /* bound: blob pages (ceil — a partial trailing page must stage too or
+     * the search takes a miss the legacy path never did), clipped to the
+     * window minus the pinned tail control pages */
+    uint64_t maxl = ((uint64_t)n->mbe->size >> 12) - DER_TAIL_PIN_PAGES;
+    uint64_t end = (a0 + 4095) >> 12;
+    if (end > maxl) {
+        end = maxl;
+    }
+
+    /* progress word lives in resp.reserved, inside the tail-pinned mailbox
+     * page (never cache-resident: insert refuses tail lpns, and the post-job
+     * mailbox probe in pnm_thread_fn asserts it) — direct write is safe */
+    volatile uint32_t *prog = (volatile uint32_t *)
+        ((char *)n->mbe->logical_space +
+         ((uint64_t)n->mbe->size - PNM_MB_OFF_FROM_END) +
+         offsetof(struct pnm_mb_s, resp) +
+         offsetof(struct pnm_resp_s, reserved));
+
+    uint64_t staged = 0, skipped = 0;
+    for (uint64_t lpn = 0; lpn < end; lpn++) {
+        struct ppa p = get_maptbl_ent(ssd, lpn);
+        if (!mapped_ppa(&p) || !valid_ppa(ssd, &p)) {
+            skipped++;
+            continue;
+        }
+        struct cache_entry *e = cp->ops.entry_init(cp->cache_data, lpn);
+        cp->ops.insert(cp->cache_data, e, 0, false);
+        /* the policy owns the inserted entry (only eviction victims are
+         * freed inside insert) — must NOT free e here */
+        staged++;
+
+        /* billing spin + progress publish every 512 pages (2MB) */
+        if ((staged & 511) == 0) {
+            __atomic_store_n(prog, (uint32_t)staged, __ATOMIC_RELEASE);
+            if (bps) {
+                /* double: bytes * 1e9 overflows u64 past ~18GB */
+                uint64_t target = t0 +
+                    (uint64_t)((double)(staged << 12) * 1e9 / (double)bps);
+                while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < target) {
+                    /* modeled device-side bulk-read bandwidth */
+                }
+            }
+        }
+    }
+
+    /* one flush at the end (cylon_cache_reset precedent): fresh direct
+     * EPTEs were written raw from userspace; KVM must see them */
+    der_kvm_flush_tlbs(ctx, true);
+
+    st->job_staged = (uint32_t)staged;
+    st->job_found = (uint32_t)staged;   /* resp.n_found = coverage */
+    st->job_pages = skipped;            /* resp.n_pages = skipped pages */
+    st->job_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
+    st->job_dist = 0;
+    st->job_hops = 0;
+    femu_log("Cylon PNM: STAGE job %u staged %u skipped %lu (%lu ns, %lu bps)\n",
+             job_id, st->job_staged, skipped, st->job_ns, bps);
     return PNM_ST_OK;
 }
 
@@ -715,6 +815,7 @@ static void *pnm_thread_fn(void *opaque)
 
         /* defaults; SEARCH overrides */
         st->job_found = 0;
+        st->job_staged = 0;
         st->job_ns = 0;
         st->job_dist = 0;
         st->job_hops = 0;
@@ -737,6 +838,11 @@ static void *pnm_thread_fn(void *opaque)
             rc = pnm_handle_flush(st);
             femu_log("Cylon PNM: FLUSH job %u -> %d\n", mb.job.job_id, rc);
             break;
+        case PNM_OP_STAGE:
+            rc = pnm_handle_stage(st, mb.job.job_id, mb.job.a0);
+            femu_log("Cylon PNM: STAGE dispatch job %u -> %d\n",
+                     mb.job.job_id, rc);
+            break;
         default:
             femu_log("Cylon PNM: job %u unknown op %u\n", mb.job.job_id,
                      mb.job.op);
@@ -747,7 +853,7 @@ static void *pnm_thread_fn(void *opaque)
         mb.resp.job_id = mb.job.job_id;
         mb.resp.status = (uint32_t)rc;
         mb.resp.n_found = st->job_found;
-        mb.resp.reserved = 0;
+        mb.resp.reserved = st->job_staged;   /* STAGE coverage survives publish */
         mb.resp.total_ns = st->job_ns;
         mb.resp.n_dist = st->job_dist;
         mb.resp.n_hops = st->job_hops;

@@ -72,25 +72,58 @@ f=1 锚点跨月逐位复现（avx 217.391 vs E1' 217.4；scalar 227.273 vs 227.
 **验收**：所有点 dump 与 engref 逐字节一致（BI 只改时序不改结果）；新增
 `e1c_bi_sweep` CSV/PNG 进 e1c_paper/。
 
-## 4. D2 — 设备发起 staging（CXL.cache RFO 拉取）
+## 4. D2 — 设备发起 staging（FTL 后台预取变体，2026-09-06 实现）
 
-**动机**：现状 staging = guest CPU first-touch 38GB（~33 分钟，Phase C 最大部署痛点，
-CYLON-USAGE.md §8.10.3）。Type-2 设备可主动 RFO 宿主内存：设备自己把索引从 guest
-DRAM 拉进设备内存，速率由设备侧引擎决定，与 guest 单核缺页率解耦。
+**动机**：现 staging = guest 单核 first-touch 38GB：wiki 冷 33min / 同 boot restage 542s
+（Phase C 最大部署痛点，CYLON-USAGE.md §8.10.3）。税源是每页 trap+FTL 计费
+（写 miss 208µs/页），与数据搬运本身无关。Type-2 语义下设备可主动把索引搬进自己
+的介质/缓存层，速率由设备侧决定，与 guest 缺页 trap 率解耦。
 
-**实现**：
-- 新 job 类型 `JOB_STAGE`（信箱 v1 兼容载荷）：{blob 在窗口外的 guest 物理地址表,
-  目标设备区间}；引擎按大块（2MB）搬运并按 PCIe4-x8 上行带宽账单（~14GB/s 上限，
-  32GB 向量段 ≈ 2.3 分钟上限）。
-- 客户端只交出物理地址表（/proc/self/pagemap 或预留 memfd），不再逐页 first-touch。
-- 保留 first-touch 路径作 Type-3 对照（同一份数据两种 staging 的对比图）。
+**定稿语义（FTL 后台预取）**：设备已有完整介质副本（前一次 staging 的 commit 结果），
+设备把 mapped 页从介质批量重填进缓存层。RFO 直接拉 guest DRAM 的路线（pagemap
+物理地址表）deferred——见风险节。
 
-**实验**：staging 时间对比（first-touch 33min vs 设备拉取上限 ~2.3min+FLUSH 成本）；
-staging 后跑 f=0.5 一点验收逐字节一致。
+**实现**（pnm_uapi.h `PNM_OP_STAGE=4` + pnm.c `pnm_handle_stage`）：
+- 客户端提交信箱 job（a0 = blob 字节数，a1=0），引擎线程把 mapped 页（
+  `mapped_ppa && valid_ppa` 配对检查）从 logical_space（=虚拟 NAND 介质）批量
+  memcpy 进 512MB devdax 缓存槽位 + EPTE 翻直，lpn 升序 = first-touch 同序。
+- **终态一致性**（dump 逐字节一致的结构性论证）：512MB 缓存 + 9.2M 页循环 → 途中
+  ~9.1M 次内部驱逐+干净回写（mode-1 下 guest=false 驱逐 flush 是 no-op，无 IPI）；
+  终态 = 介质不变 + maptbl 不变 + 缓存 = 最后 512MB 切片——与 first-touch staging
+  的终态完全相同（first-touch 升序写 36GB 同样把最后 512MB 留在缓存）。dirty 论证：
+  D2 填充是 clean 插入，搜索纯读永不置 dirty；写回无条件 memcpy 相同字节。
+- 账单旋钮 `/tmp/femu-stage-bps`（job 开始读一次）：**缺省 = 2e9（2GB/s 建模带宽），
+  文件存在且 =0 → 不计费**——与其他 /tmp 旋钮 absent=off 语义不同，是有意设计：
+  D2 的价值主张就是"设备侧速率"，缺省即计费。wall = max(真实填充, 36GB/bps)，
+  真实快则补差自旋、慢则自然节流。进度词 = resp.reserved（每 512 页发布，信箱页
+  tail-pinned 直写安全）；最终覆盖数 = resp.n_found，跳过数 = resp.n_pages。
+- **回退协议**：fresh boot（maptbl 全 UNMAPPED）→ 覆盖 0 → 客户端告警 + 防御性
+  FLUSH + 整体 stage_file 回退（first-touch 33min，每次 boot 一次）；老引擎
+  ENOSYS → 同回退；超时 1h → exit(2) **不回退**（引擎还在 job 中，回退会与最终
+  publish 在信箱页上竞争）。`--stage=dev` 覆盖 `-S`（dev 模式必做 ping+FLUSH+STAGE）。
+- 双客户端支持：cpu_search（wiki 实验主客户端）与 pnm_client（SIFT）同款
+  `--stage=dev|ft`；wiki_exp.sh 第 4 参 `ft|dev` 透传。
 
-**风险**：从 guest 用户态拿可靠物理地址表是脏活；备选 = 走既有 window 直写路径
-（不 RFO guest DRAM，而是设备从"虚拟 NAND"读——即 staging 语义改成 FTL 后台预取，
-绕开 pagemap）。
+**验收（2026-09-06 全过，exp/es_results.csv）**：7 点 dump 全部逐字节=engref；
+搜索 wall 110.8-117.2s / misses 4291-4301 / recall 0.9720 全带内 → **DSE 不受扰**。
+staging 对比（wiki 36GB）：
+| 路径 | staging wall |
+|---|---|
+| first-touch 冷（fresh boot，es_fresh 回退实测） | 2003s（33.4 min） |
+| first-touch restage（maptbl 满，read 计费，es_ft_restage） | 520.9s |
+| **dev 真实下限**（knob=0 不计费，es_t0） | **21.3s（≈1.7GB/s 设备侧 bulk）** |
+| dev 缺省 2GB/s（es_t1） | 21.1s（计费目标 18.4s < 下限，真实填充主导） |
+| dev 14GB/s（es_t2） | 25.3s（同上） |
+| dev 0.5GB/s（es_slow） | 75.7s（**计费显形**：72s 目标 + 交叠） |
+→ **95×/24.7× vs 冷/restage**；账单只在 bps < ~1.7GB/s 时显形（wall =
+max(真实填充, 字节/bps) 模型成立）；计费区间演示 @0.5GB/s。T3 回退（覆盖 0 →
+防御 FLUSH + first-touch）验证通过。已知非 D2 事件：es_t1 首试中 avx-collab
+GPF 竞态族（§8.10.4），重试协议生效，重试全绿。
+
+**风险与边界**：不做 RFO/pagemap（deferred，等用户）；设备信任介质内容与 guest
+blob 一致（换 blob 需 fresh boot 或重新 first-touch——verify_window 会在 run 尾大声
+报 9.2M 页 differ，门禁兜底）；BI≠0 时 STAGE 完成也付一次 retrap 计费（预期）。
+不做 D3/D4（等用户指令）。
 
 ## 5. D3 — 信箱 v2：Device Atomics + MSI-X doorbell
 
