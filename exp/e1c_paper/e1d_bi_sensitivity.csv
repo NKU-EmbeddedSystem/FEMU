@@ -1,0 +1,6 @@
+point,bi_ns,client,wall_s,qps,t_cpu_s,t_eng_s,eng_dist_per_q,eng_hops_per_q,exec_ms_per_q,eng_misses_per_q,recall,dump_vs_engref
+wikibi_0,0,avx,115.142,8.7,110.419,115.141,4726.7,114.6,230.1,4294.6,0.9720,identical
+wikibi_250,250,avx,114.390,8.7,110.264,114.356,4726.7,114.6,228.6,4290.9,0.9720,identical
+wikibi_500,500,avx,114.186,8.8,110.070,114.150,4726.7,114.6,228.1,4282.4,0.9720,identical
+wikibi_1k_scalar,1000,scalar,115.570,8.7,113.037,115.533,4726.7,114.6,230.9,4292.0,0.9720,identical
+wikibi_proof_s,5000000,scalar,117.412,8.5,117.411,111.621,4726.7,114.6,220.5,4298.5,0.9720,identical

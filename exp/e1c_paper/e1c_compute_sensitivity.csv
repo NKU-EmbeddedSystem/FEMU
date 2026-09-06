@@ -1,0 +1,12 @@
+point,comp_ns,label,wall_s,qps,t_cpu_s,t_eng_s,eng_exec_ms_per_q,eng_dist_per_q,eng_misses_per_q,recall@10,dump_vs_engref,wall_model_s
+wikie1_f0.5,0,default profile (2-8 TFLOPS),114.129,8.8,111.589,114.129,228.2,4726.7,4294.4,0.972,identical,
+wikic_v1,1,2 TFLOPS (rounded up to knob min),111.486,9.0,109.877,111.485,222.9,4726.7,4291.3,0.972,identical,112.685
+wikic_v4,4,~0.4 TFLOPS-equiv,111.908,8.9,109.453,111.908,223.7,4726.7,4291.8,0.972,identical,112.692
+wikic_v16,16,0.10T,113.5,8.8,110.433,113.499,226.9,4726.7,4292.1,0.972,identical,112.721
+wikic_v64,64,0.024T,111.933,8.9,109.591,111.932,223.8,4726.7,4293.4,0.972,identical,112.834
+wikic_v256,256,0.006T,113.142,8.8,109.607,113.141,226.2,4726.7,4291.0,0.972,identical,113.288
+wikic_x500,500,between ARM and 8.9.7 anchor,113.112,8.8,109.836,113.112,226.1,4726.7,4290.7,0.972,identical,113.865
+wikic_x1000,1000,ARM controller (8.9.7 axis),115.528,8.7,110.646,115.528,231.0,4726.7,4292.3,0.972,identical,115.046
+wikic_x4000,4000,weak controller,120.922,8.3,108.738,120.922,241.8,4726.7,4305.9,0.972,identical,122.136
+wikic_x16000,16000,sub-0.0001T,147.15,6.8,109.584,147.149,294.2,4726.7,4295.5,0.972,identical,150.497
+wikic_x48000,48000,knee region (~0.032mT-equiv collapse),221.072,4.5,109.211,221.071,442.0,4726.7,4293.2,0.972,identical,226.124
