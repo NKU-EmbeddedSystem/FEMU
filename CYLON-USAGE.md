@@ -335,6 +335,13 @@ Phase A 引擎 BIND 时把整份索引快照进本地内存（local copy）；Ph
   = 2GB/s 计费（缺省操作点）｜**~2.6s** = 14GB/s｜**33min/542s** = first-touch（fresh boot
   回退路径覆盖 0 → 自动 FLUSH + stage_file，客户端日志 `falling back to first-touch`）。
   覆盖数 = resp.n_found；老引擎 ENOSYS → 回退；超时不回退（引擎 mid-job）。
+- **使用配方（分支角色，2026-09-06 定）**：活跃实验线 = `cylon-v9.1-type2`
+  （origin/dev-cxl-type2）；`cylon-v9.0.1`（origin/cxl-accelator）= Type-3 论文快照，
+  冻结。**Type-3 实验直接在 type2 分支引擎上跑**——分支只是叙事容器，配置开关是
+  旋钮：BI 旋钮不建（缺席=off）+ 不调 STAGE op 即 Type-3 配置（es T 系列 = 活证，
+  dump 全逐字节 = engref）。每 boot 首跑必须 ft（建 maptbl，冷 33min 一次）；之后
+  所有点用 `dev` 加速（终态已证逐位同；E-S 里 Type-3 的 staging 数字除外——那是
+  被测对象，必须 ft 忠实跑）。
 - **canonical tie-break**：~14% 查询 top-10 含相邻等距对，裸 qsort tie 序随堆内序漂移 →
   `pnm.c pnm_cmp_asc` 与 `engref.c pnm_cnd_asc` 都按 (d, id) 排序。**engref 参考已重生成**
   （2026-09-04，recall 0.9896→0.9898；旧 dump 系早期 engref 二进制产物，备份 .pre-tiebreak）。
