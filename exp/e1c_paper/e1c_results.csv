@@ -1,0 +1,9 @@
+point,mode,f,wall_s,qps,t_cpu_s,t_eng_s,exec_ms_per_q,misses_per_q,dist_per_q,hops,recall@10,dump_vs_engref,qps_ideal_model,speedup_vs_pure_cpu
+wiki_f1_stage,scalar,1.00,227.3,4.4,227.3,,,,,,0.9720,identical,4.60,0.96
+wikie1_f1,avx,1.00,217.4,4.6,217.4,,,,218.360,114.4,0.9720,identical,4.60,1.00
+wikie1_f0.65,avx,0.65,142.527,7.0,142.526,78.403,223.935,4322.4,4736.2,114.9,0.9720,identical,7.08,1.52
+wikie1_f0.5,avx,0.50,114.1,8.8,111.6,114.1,228.171,4294.4,4726.7,114.6,0.9720,identical,9.20,1.91
+wikie1_f0.75,avx,0.75,163.668,6.1,163.666,58.591,234.261,4325.8,4744.2,115.0,0.9720,identical,6.13,1.33
+wikie1_f0.25,avx,0.25,159.786,6.3,56.222,159.785,212.976,4290.7,4705.6,114.4,0.9720,identical,6.40,1.37
+wikie1_f0,avx,0.00,208.3,4.8,,208.3,207.674,4299.5,4706.4,114.4,0.9720,identical,4.80,1.04
+host_engref_ef100,host-ref,,,12.7,84.6,,,,,,0.9720,ref-itself,,,
