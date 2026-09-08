@@ -4,6 +4,7 @@ cylon_sources = files(
   'cylon/pnm.c',
   'cylon/ftl_thread.c',
   'cylon/der_kvm.c',
+  'cylon/doorbell.c',
   'cylon/cache/cache.c',
   'cylon/cache/policy/cache_policy_registry.c',
   'cylon/cache/policy/fifo.c',

@@ -49,6 +49,16 @@
 #define PNM_MB_PENDING  1
 #define PNM_MB_DONE     2
 
+/* v2 state word: status and generation packed as one aligned u64 at the
+ * tail of the mailbox, so each side publishes transitions with a single
+ * atomic u64 store. Client owns gen (increments per job, kills ABA/replay
+ * of stale PENDING); engine accepts PENDING only if gen == last+1.
+ * gen==0 means a legacy v1 client (old binaries leave the high half 0) —
+ * engine falls back to v1 semantics (no gen check). */
+#define PNM_MB_PACK(gen, st)  ((((uint64_t)(gen)) << 32) | (uint32_t)(st))
+#define PNM_MB_STATE(w)       ((uint32_t)((w) & 0xffffffffu))
+#define PNM_MB_GEN(w)         ((uint32_t)((w) >> 32))
+
 /* mailbox/scratch placement, offsets from END of the CXL window */
 #define PNM_MB_OFF_FROM_END         4096
 #define PNM_RESULTS_OFF_FROM_END    20480
@@ -79,12 +89,17 @@ struct pnm_resp_s {
     uint64_t n_pages;     /* search-time cache misses (NAND page reads charged) */
 };
 
-/* mailbox (one outstanding job in Phase A) */
+/* mailbox (one outstanding job; v2 state word packs status+gen as u64) */
 struct pnm_mb_s {
     struct pnm_job_s job;    /* 64B */
     struct pnm_resp_s resp;  /* 40B */
-    uint32_t status;         /* IDLE/PENDING/DONE */
-    uint32_t reserved;
+    union {
+        uint64_t state;      /* atomic view: (gen << 32) | status */
+        struct {
+            uint32_t status;     /* IDLE/PENDING/DONE (low half) */
+            uint32_t gen;        /* job generation, client-owned (high) */
+        };
+    };
 };
 
 /* CYH1 index blob (written by tools/export_hnsw.py, bound by engine).

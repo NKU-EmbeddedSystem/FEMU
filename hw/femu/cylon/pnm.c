@@ -21,6 +21,7 @@
 #include "cxlssd.h"
 #include "pnm_uapi.h"
 #include "der_kvm.h"
+#include "doorbell.h"
 #include "cache/cache.h"
 #include "cache/cache_plugin.h"
 #include "qemu/thread.h"
@@ -179,6 +180,7 @@ struct pnm_state {
     uint64_t job_misses, job_miss_ns;   /* search-time cache misses + charge */
     uint32_t job_found;
     uint32_t job_staged;         /* STAGE: pages bulk-filled (resp.reserved) */
+    uint32_t mb_gen;             /* v2 state word: generation of last accepted job */
 };
 
 /* cache-aware translation: hit -> pmem cache slice, miss -> logical_space */
@@ -783,9 +785,11 @@ static void *pnm_thread_fn(void *opaque)
          * the payload: on x86 the later field loads are then guaranteed to
          * see the stores that became visible before PENDING (TSO keeps store
          * order). Without this, ~1% of jobs run the previous job's a0. */
-        uint32_t status;
-        pnm_read(ctx, n, mb_off + offsetof(struct pnm_mb_s, status),
-                 &status, sizeof(status));
+        uint64_t state;
+        pnm_read(ctx, n, mb_off + offsetof(struct pnm_mb_s, state),
+                 &state, sizeof(state));
+        uint32_t status = PNM_MB_STATE(state);
+        uint32_t gen = PNM_MB_GEN(state);
         {
             static unsigned dbg_n;
             dbg_n++;
@@ -813,6 +817,22 @@ static void *pnm_thread_fn(void *opaque)
             continue;
         }
 
+        /* v2 generation check: client increments gen per job; accept only
+         * the next one (stale-PENDING replay/ABA dies here). gen==0 is the
+         * legacy/resync frame: v1 clients always send it, and a fresh v2
+         * client process sends it as its first job to resync after restart. */
+        if (mb.gen != 0 && mb.gen != (uint32_t)(st->mb_gen + 1)) {
+            static unsigned warned;
+            if (warned++ < 8) {
+                femu_log("Cylon PNM: stale PENDING gen=%u (expect %u), "
+                         "job %u ignored\n",
+                         mb.gen, st->mb_gen + 1, mb.job.job_id);
+            }
+            g_usleep(50);
+            continue;
+        }
+        st->mb_gen = mb.gen;
+
         /* defaults; SEARCH overrides */
         st->job_found = 0;
         st->job_staged = 0;
@@ -820,6 +840,30 @@ static void *pnm_thread_fn(void *opaque)
         st->job_dist = 0;
         st->job_hops = 0;
         st->job_pages = 0;
+
+        /* D3 Device-Atomic transport bill (live knob /tmp/femu-atomic-ns,
+         * absent/0 = off -- comp_dly knob family): charged once per accepted
+         * job, modeling the device-side atomic that claims the job slot.
+         * Logged separately from job_ns (transport cost, not op time). */
+        {
+            uint64_t atomic_ns = 0;
+            FILE *af = fopen("/tmp/femu-atomic-ns", "r");
+            if (af) {
+                char ab[32] = { 0 };
+                if (fgets(ab, sizeof(ab), af)) {
+                    atomic_ns = strtoull(ab, 0, 0);
+                }
+                fclose(af);
+            }
+            if (atomic_ns) {
+                int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0 < atomic_ns) {
+                    ;
+                }
+                femu_log("Cylon PNM: atomic bill job %u (%lu ns)\n",
+                         mb.job.job_id, (unsigned long)atomic_ns);
+            }
+        }
 
         int rc;
         switch (mb.job.op) {
@@ -862,8 +906,8 @@ static void *pnm_thread_fn(void *opaque)
         pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, resp),
                   &mb.resp, sizeof(mb.resp));
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        uint32_t done = PNM_MB_DONE;
-        pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, status),
+        uint64_t done = PNM_MB_PACK(gen, PNM_MB_DONE);
+        pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, state),
                   &done, sizeof(done));
 
         /* D1 Type-2 BI bill: flip the mailbox page (and the results page
@@ -891,6 +935,12 @@ static void *pnm_thread_fn(void *opaque)
                          mb.job.job_id, (unsigned long)bi_ns);
             }
         }
+
+        /* D3 Phase 2 doorbell: raise the guest IRQ after DONE publish + BI
+         * retrap, so a doorbell-woken client's pickup read still traps and
+         * bills. No-op when the doorbell device is absent or MSI-X is still
+         * masked (guest driver not loaded). */
+        cylon_doorbell_notify();
         /* readback probe: the invariant is that the mailbox page NEVER
          * lives in a cache slot (it is tail-pinned direct); rb == done is
          * racy by design — the client resets the mailbox for the next job

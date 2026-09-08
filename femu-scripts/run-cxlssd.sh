@@ -147,6 +147,13 @@ dram_size=16G
 echo "$der_flush" > /tmp/femu-der-flush
 echo "$comp_dly" > /tmp/femu-compute-ns
 echo "$bi_lat" > /tmp/femu-bi-lat-ns
+# D3 Phase 2: attach the cylon-doorbell MSI-X device (file knob
+# /tmp/femu-doorbell = 1; launch-time only, restart to change; absent/0 =
+# off so the default path stays byte-identical).
+db=$(cat /tmp/femu-doorbell 2>/dev/null || true)
+if [ "$db" = "1" ]; then
+    CYLON_DB_ARG="bus=pcie.0"
+fi
 sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
@@ -166,6 +173,7 @@ sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
     -device cxl-type3,bus=root_port13,femu=femu-cxlssd,id=cxl-ssd0 \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=${ssd_size}M \
+    ${CYLON_DB_ARG:+-device cylon-doorbell,bus=pcie.0} \
     -net user,hostfwd=tcp::8080-:22 \
     -net nic,model=e1000 \
     -nographic \
