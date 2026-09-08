@@ -19,6 +19,13 @@ LDLIBS   = -lpthread -lm
 
 all: libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min
 
+# faiss adapter: needs a conda-forge libfaiss (headers + lib), e.g.
+#   micromamba create -p /tmp/faiss-env -c conda-forge libfaiss
+FAISS_INC ?= /tmp/faiss-env/include
+FAISS_LIB ?= /tmp/faiss-env/lib
+CXX      ?= g++
+FAISS_LDFLAGS = -L $(FAISS_LIB) -lfaiss -Wl,-rpath,$(FAISS_LIB)
+
 libcylon.so: src/cylon.c src/cylon_api.c src/cylon_internal.h include/cylon.h $(PNM_INC)/pnm_uapi.h
 	$(CC) $(CFLAGS) $(INC) -shared src/cylon.c src/cylon_api.c -o $@ $(LDLIBS)
 
@@ -34,7 +41,10 @@ cpu_search_vec: src/cpu_search_main.c libcylon_avx.so
 c_min: examples/c_min.c libcylon.so
 	$(CC) $(CFLAGS) $(INC) examples/c_min.c libcylon.so -o $@ $(LDLIBS) -Wl,-rpath,'$$ORIGIN'
 
+faiss_demo: examples/faiss_demo.cpp adapters/faiss/cylon_index.cpp adapters/faiss/cylon_index.hpp include/cylon.h src/cylon_internal.h libcylon.so $(PNM_INC)/pnm_uapi.h
+	$(CXX) -O2 -std=c++17 -I include -I src -I adapters/faiss -I $(PNM_INC) -I $(FAISS_INC) adapters/faiss/cylon_index.cpp examples/faiss_demo.cpp -L. -lcylon -o $@ $(LDLIBS) $(FAISS_LDFLAGS) -Wl,-rpath,'$$ORIGIN'
+
 clean:
-	rm -f libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min
+	rm -f libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min faiss_demo
 
 .PHONY: all clean

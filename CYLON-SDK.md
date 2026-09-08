@@ -1,14 +1,21 @@
 # CYLON-SDK 设计 — 用户态加速库：让 CXL-SSD 加速器可被方便使用与集成
 
-状态：**v1.3（2026-09-08）M1 已落码部署，门禁全过**：sdk/（libcylon.so 双档 + 薄
-CLI + c_min C API 例子 + tests）repo + guest /tmp/sdk 均构建通过；C ABI = §3（search()
-行内 [m,k) padding 语义见决策 2，m 可重建）。门禁矩阵（全 dump 逐字节 == engref
-ec3059fbb6561f67fb2b2402603fbf3c）：CONTROL 臂 scalar CLI（wall 116.28s，本臂新锚）
-+ b250 scalar CLI ×2（113.67 带内 / 117.18 噪声出带）+ b250 avx CLI（113.40 带内）
-+ **c_min C API 路径（b250）逐字节过**，引擎计数逐位归位。事故记录：首跑 c_min
-dump 错 = 手写 stage_buf memcpy 源指针步进翻倍 + 堆越界读（已修复；教训 = 手写
-数据面必审指针算术）；A2/B 首跑 GPF = 崩溃族概率性复现（b250_f050 历史稳定格上
-首次双臂同格崩，重跑全部存活，数据确定性不受影响）。四决策不变：①cpu_search
+状态：**v1.4（2026-09-08）M1+M2 已落码部署，门禁全过**：sdk/（libcylon.so 双档 + 薄
+CLI + c_min C API 例子 + faiss 适配器 CylonIndex + ctypes Python 绑定 + tests）repo +
+guest /tmp/sdk 均构建通过；C ABI = §3（search() 行内 [m,k) padding 语义见决策 2，m
+可重建）。M1 门禁矩阵（全 dump 逐字节 == engref ec3059fbb6561f67fb2b2402603fbf3c）：
+CONTROL 臂 scalar CLI（wall 116.28s，本臂新锚）+ b250 scalar CLI ×2（113.67 带内 /
+117.18 噪声出带）+ b250 avx CLI（113.40 带内）+ c_min C API（b250）逐字节过，引擎
+计数逐位归位。**M2 门禁三连（b250 臂，BI knob=250）**：c_min (F16 C API) / faiss_demo
+(F32 适配器) / py_demo (F32 ctypes) 三 dump 全部逐字节 == engref；引擎 dist 2363339 /
+hops 57302 三客户端全程位等（pages 抖动 = BI retrap 时序）；适配开销（ext-wall vs
+c_min 同臂）：faiss −3.7% / py −4.0%（负值 = 噪声内 <5% ✓）。事故记录：M1 = 手写
+stage_buf memcpy 源指针步进翻倍 + 堆越界读（教训 = 手写数据面必审指针算术）；M2 =
+①cylon.py 把 u32 标签流写进 uint64 numpy 缓冲（stride-2 交错混排，修复 = u32 缓冲；
+教训 = ctypes 缓冲 dtype 必须逐字段对照 ABI）②faiss_demo fp16→fp32 升位 subnormal
+归一化 ex 初值差 2（值恒缩 4×，860/768000 个查询分量，2 行并列被微扰翻转；教训 =
+手写浮点转换必对 numpy 位级对拍）。A2/B 首跑 GPF + M2 faiss_demo 首跑 SIGSEGV =
+崩溃族概率性复现（重试存活，数据确定性不受影响）。四决策不变：①cpu_search
 平移进 sdk/（搬家而非复制，splitter = sdk/tools/split_cpu_search.py）；②适配器
 FAISS 先行；③建图工具不入范围；④精度 = 接口按"一类加速器"设计（输入精度可选
 枚举含预留档案 + 设备档案 info 自述 + 损失明示/re-rank 无损路径）。
@@ -281,12 +288,15 @@ struct CylonIndex : faiss::Index {
   薄壳 vs engref 逐字节；SDK C API 路径同点逐字节；wall 带内（±3%）
 - 交付：libcylon.so + cylon.h + tests/（对拍工具 dump 与 engref cmp）
 
-**M2（FAISS 适配器 + Python）**：
-- CylonIndex(faiss::Index) 子类 + C++ 例子；ctypes Python 绑定
-- 门禁：FAISS 路径 = C API 路径 = cpu_search 薄壳 = engref 逐字节三重对拍；
-  Python numpy 路径 recall == C 路径 recall；适配开销（fp32→fp16 + 拷出）
-  wall +<5%
-- 交付：faiss 例子（wiki 21M 点查询 demo）+ pycylon
+**M2（FAISS 适配器 + Python）— 完成（2026-09-08）**：
+- CylonIndex(faiss::Index) 子类 + faiss_demo；ctypes Python 绑定 cylon.py + py_demo
+- 门禁：FAISS 路径 = Python 路径 = C API 路径 = engref 逐字节三重对拍 ✓
+  （b250 臂；引擎计数位等；适配开销 faiss −3.7% / py −4.0%，<5% ✓；
+  faiss_demo 首跑 SIGSEGV = 崩溃族，重试存活过门禁）
+- 交付：sdk/adapters/faiss/（CylonIndex）+ sdk/examples/faiss_demo.cpp +
+  sdk/bindings/python/（cylon.py + py_demo.py）；guest 依赖 = conda-forge libfaiss
+  (/tmp/faiss-env, 无 sudo) + apt python3-numpy；pybind/spike 否决 — ctypes 直达
+  C ABI（§10 风险项关闭）
 
 **M3（生态故事）**：
 - hnswlib 适配器（可选）；auto-f 启发式验收（f 扫描对照：auto 收敛到 0.5±0.1
@@ -309,8 +319,9 @@ struct CylonIndex : faiss::Index {
 - **auto-f**：max 模型在 E1/E2 都内点 ≤5%，但单查询级 T_cpu/T_eng 抖动大 →
   auto 更新用**批次级**（每 search 调用一次更新），并在 stats 里暴露本次 f。
   验收 M3 里给 f 扫描对照。
-- **FAISS python 包装自定义 Index 的现成路径**未验证（M2 第一步先做可行性
-  spike：pybind 侧 wrap CylonIndex，或退回独立 pycylon 模型）。
+- ~~**FAISS python 包装自定义 Index 的现成路径**未验证~~ **已关闭（M2）**：跳过
+  pybind 包装 faiss::Index 的可行性 spike，直接 ctypes 绑 C ABI（cylon.py）——
+  faiss 适配留在 C++ 侧（faiss_demo 可用），Python 用户走 pycylon 原生 API。
 - doorbell .ko 缺失时 auto 降级 poll：统计里记录，文档写明（E-M 判别器语义
   保留：投递死 = wall 膨胀 5000s+，库照常返回正确结果）。
 - 48GB 单索引上限：多索引 = 引擎侧新故事（非目标）。

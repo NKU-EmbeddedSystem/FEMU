@@ -63,7 +63,10 @@ extern struct cylon_st st;
 #endif
 
 /* collab merged-result capacity (k <= this) */
-#define COLLAB_KMAX 64
+#include "cylon.h"
+
+/* k upper bound is ABI-level: alias the public constant */
+#define COLLAB_KMAX CYLON_KMAX
 
 /* platform state (cylon.c) */
 extern uint8_t *win;

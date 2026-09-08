@@ -103,6 +103,13 @@ cylon_status cylon_get_info(const cylon_ctx *ctx, cylon_info *out);
 uint32_t cylon_dim(const cylon_ctx *ctx);
 uint64_t cylon_ntotal(const cylon_ctx *ctx);
 
+/* device search contract: k upper bound (must match the engine; the
+ * moved core's COLLAB_KMAX is the same number via cylon_internal.h) */
+#define CYLON_KMAX 64
+
+/* readable status text (C++/Python adapter layers; never NULL) */
+const char *cylon_strerror(cylon_status st);
+
 #ifdef __cplusplus
 }
 #endif

@@ -584,3 +584,18 @@ uint64_t cylon_ntotal(const cylon_ctx *ctx)
 {
     return ctx && ctx->loaded ? st.count : 0;
 }
+
+const char *cylon_strerror(cylon_status st)
+{
+    switch (st) {
+    case CYLON_ST_OK:     return "ok";
+    case CYLON_ST_EINVAL: return "invalid argument/config";
+    case CYLON_ST_ENODEV: return "device/window unreachable";
+    case CYLON_ST_ETO:    return "engine timeout (close+open to recover)";
+    case CYLON_ST_EAVX:   return "avx build at f=0.25 poison point";
+    case CYLON_ST_EPREC:  return "requested input precision not in "
+                                 "info.in_prec_mask";
+    case CYLON_ST_EBUSY:  return "device busy (another ctx holds the window)";
+    }
+    return "unknown status";
+}
