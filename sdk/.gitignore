@@ -1,0 +1,7 @@
+# build products (host + guest builds drop these here)
+*.so
+c_min
+cpu_search
+cpu_search_vec
+# session state
+.omc/
