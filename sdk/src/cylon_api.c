@@ -528,6 +528,9 @@ cylon_status cylon_search(cylon_ctx *ctx, cylon_prec prec,
         printf("cylon: auto-f -> %.3f (t_c %.3fs t_e %.3fs per-query)\n",
                ctx->f_cur, t_c, t_e);
     }
+    if (stats) {
+        stats->f_cur = (float)ctx->f_cur;
+    }
     free(conv);
     free(g_all_ids); free(g_all_d); free(g_all_m);
     g_all_ids = NULL; g_all_d = NULL; g_all_m = NULL;

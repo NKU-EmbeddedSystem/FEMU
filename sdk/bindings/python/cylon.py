@@ -58,7 +58,8 @@ class CylonStats(C.Structure):
     _fields_ = [("n_dist", C.c_uint64),
                 ("n_hops", C.c_uint64),
                 ("n_pages", C.c_uint64),
-                ("engine_ns", C.c_uint64)]
+                ("engine_ns", C.c_uint64),
+                ("f_cur", C.c_float)]
 
 
 def _bind(path):
@@ -156,7 +157,8 @@ class Cylon:
             raise RuntimeError("cylon_search: " + self._strerror(st))
         self._last_stats = {"n_dist": stats.n_dist, "n_hops": stats.n_hops,
                             "n_pages": stats.n_pages,
-                            "engine_ns": stats.engine_ns}
+                            "engine_ns": stats.engine_ns,
+                            "f_cur": stats.f_cur}
         return D, L
 
     @property

@@ -74,9 +74,12 @@ typedef struct {
 } cylon_info;
 
 /* Engine response counters, passed through unmodified (paper-experiment
- * surface; n_dist/n_hops/n_pages feed the misses->wall predictions). */
+ * surface; n_dist/n_hops/n_pages feed the misses->wall predictions).
+ * f_cur = the collab split in effect for THIS batch (auto mode: the
+ * post-update value; fixed mode: cfg cpu_frac). */
 typedef struct {
     uint64_t n_dist, n_hops, n_pages, engine_ns;
+    float    f_cur;
 } cylon_stats;
 
 /* ---- lifecycle ---- */

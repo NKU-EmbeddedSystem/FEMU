@@ -1,6 +1,6 @@
 # CYLON-SDK 设计 — 用户态加速库：让 CXL-SSD 加速器可被方便使用与集成
 
-状态：**v1.4（2026-09-08）M1+M2 已落码部署，门禁全过**：sdk/（libcylon.so 双档 + 薄
+状态：**v1.5（2026-09-08）M1+M2+M3 全部完成，门禁全过**：sdk/（libcylon.so 双档 + 薄
 CLI + c_min C API 例子 + faiss 适配器 CylonIndex + ctypes Python 绑定 + tests）repo +
 guest /tmp/sdk 均构建通过；C ABI = §3（search() 行内 [m,k) padding 语义见决策 2，m
 可重建）。M1 门禁矩阵（全 dump 逐字节 == engref ec3059fbb6561f67fb2b2402603fbf3c）：
@@ -9,13 +9,29 @@ CONTROL 臂 scalar CLI（wall 116.28s，本臂新锚）+ b250 scalar CLI ×2（1
 计数逐位归位。**M2 门禁三连（b250 臂，BI knob=250）**：c_min (F16 C API) / faiss_demo
 (F32 适配器) / py_demo (F32 ctypes) 三 dump 全部逐字节 == engref；引擎 dist 2363339 /
 hops 57302 三客户端全程位等（pages 抖动 = BI retrap 时序）；适配开销（ext-wall vs
-c_min 同臂）：faiss −3.7% / py −4.0%（负值 = 噪声内 <5% ✓）。事故记录：M1 = 手写
+c_min 同臂）：faiss −3.7% / py −4.0%（负值 = 噪声内 <5% ✓）。**M3 门禁全过**：
+M3-1 auto-f（stats.f_cur 回读 + autof_check）f 扫描 {0.25/0.5/0.65/auto} 四臂
+（b250/1000q 单臂，BI knob=250）dump 全部逐字节 == engref（E1'' 不变量再证：数据
+与 f 无关）；计数器随 f 单调：f=0.25 wall 160.8s dist 3529216（引擎瓶颈）、f=0.5
+wall 113.5s dist 2363339（引擎瓶颈近最优）、f=0.65 wall 135.6s（CPU 瓶颈 650×0.207s，
+交叉点）、auto 3 批 f 0.5→0.525→0.522 CONVERGED（0.5±0.1 内 1 次更新，f'=t_e/(t_c+t_e)
+批次级均衡拆分），总 wall 112.7s ≈ 固定 f=0.5 臂。M3-2 hnswlib CylonHnsw
+（AlgorithmInterface<float> 0.8.0 sdist 头）addPoint/saveIndex 拒绝 + 逐查询
+searchKnn（nq=1 → 全 CPU 退化，引擎计数全 0，wall 210.7s——正确性与 f 无关不受
+退化影响）；**集合级门禁 1000/1000 行**（m + 升序 ids + pad 规范化 vs engref
+提交序）PASS——两种调用形态/两种结果表示同源同正确。M3-3 TUTORIAL.md（§0-§6：
+三语言上手 + auto-f + 约束表 + 验收锚点）。事故记录：M1 = 手写
 stage_buf memcpy 源指针步进翻倍 + 堆越界读（教训 = 手写数据面必审指针算术）；M2 =
 ①cylon.py 把 u32 标签流写进 uint64 numpy 缓冲（stride-2 交错混排，修复 = u32 缓冲；
 教训 = ctypes 缓冲 dtype 必须逐字段对照 ABI）②faiss_demo fp16→fp32 升位 subnormal
 归一化 ex 初值差 2（值恒缩 4×，860/768000 个查询分量，2 行并列被微扰翻转；教训 =
-手写浮点转换必对 numpy 位级对拍）。A2/B 首跑 GPF + M2 faiss_demo 首跑 SIGSEGV =
-崩溃族概率性复现（重试存活，数据确定性不受影响）。四决策不变：①cpu_search
+手写浮点转换必对 numpy 位级对拍）。A2/B 首跑 GPF + M2 faiss_demo 首跑 SIGSEGV + M3 战役 5 次 GPF/SEGV（f050/auto/
+f065×3）= 崩溃族概率性复现（全部重试存活，数据确定性不受影响）；M3 取证升级：
+GPF ip 恒落 libcylon.so 加载基址 +0x18f8（avx +0x1978）= .rela.plt 尾→.init 间
+零填充（R 段 ELF 元数据，代码改动不动它）——跨客户端/跨重建/跨 ASLR 确定性落点
+= 确定性错跳而非随机踩踏（ip−vm_start < .text 起点 = 控制流转移证据）；教训：
+诊断输出必须整文件捕获（`2>&1 | tail -N` 的 stderr 先落 + stdout 退出刷出会把
+报错行顶出窗口 = "静默死"幻影）。四决策不变：①cpu_search
 平移进 sdk/（搬家而非复制，splitter = sdk/tools/split_cpu_search.py）；②适配器
 FAISS 先行；③建图工具不入范围；④精度 = 接口按"一类加速器"设计（输入精度可选
 枚举含预留档案 + 设备档案 info 自述 + 损失明示/re-rank 无损路径）。
@@ -248,7 +264,7 @@ struct CylonIndex : faiss::Index {
 - 用户故事：`faiss::Index* idx = new CylonIndex(cfg); idx->search(...)`，或
   Python 侧 `faiss` 现有绑定层直接消费该 Index 子类（faiss python 对自定义
   Index 的包装有现成路径；pybind 实现为 faiss 贡献补丁形态）。
-- **hnswlib 适配器**（M3，可选）：实现 `AlgorithmInterface<float>::knn_query`
+- **hnswlib 适配器**（M3 ✅）：CylonHnsw : `AlgorithmInterface<float>`（searchKnn）
   薄壳，故事是"CYH1 = hnswlib 图的设备驻留形态"（同一 build 谱系）。
 - **Python 绑定**（M2 尾/M3）：ctypes 起步（guest 零依赖，pip 不需要）：
   `libcylon.so` 直接 ctypes；numpy fp32 (nq,dim) → cylon_search 一行映射。
@@ -298,9 +314,30 @@ struct CylonIndex : faiss::Index {
   (/tmp/faiss-env, 无 sudo) + apt python3-numpy；pybind/spike 否决 — ctypes 直达
   C ABI（§10 风险项关闭）
 
-**M3（生态故事）**：
-- hnswlib 适配器（可选）；auto-f 启发式验收（f 扫描对照：auto 收敛到 0.5±0.1
-  3 次内）；教程/示例 notebook 形态的论文 artifact 骨架
+**M3（生态故事）— 完成（2026-09-08）**：
+- M3-1 **auto-f 验收**：cylon_stats 扩展 f_cur（40B，客户端需重编）+ autof_check
+  工具（-F auto|frac）。f 扫描 {0.25/0.5/0.65/auto} 四臂（b250/1000q 单臂）dump
+  全部逐字节 == engref —— E1'' 不变量再证（数据与 f 无关，f 只重排查询归谁算）。
+  计数器单调：f=0.25 wall 160.8s / dist 3529216 / engine_ns 160.6s（引擎瓶颈，
+  wall≈engine_ns）；f=0.5 wall 113.5s / dist 2363339 / engine_ns 113.3s（近最优）；
+  f=0.65 wall 135.6s（CPU 瓶颈：CPU 侧 650×0.207s=134.6s 交叉点）；auto 3 批
+  （334/334/332）f 0.5→0.525→0.522 CONVERGED——f' = t_e/(t_c+t_e) 批次级均衡拆分
+  收敛于 CPU/引擎单查询耗时交叉点（0.229/(0.207+0.229)=0.525 预测吻合），
+  总 wall 112.7s ≈ 固定 f=0.5 臂 113.5s（噪声内）。
+- M3-2 **hnswlib 适配器**：CylonHnsw : hnswlib::AlgorithmInterface<float>
+  （0.8.0 sdist 头文件，零依赖）；addPoint/saveIndex 拒绝（CYH1 预建索引语义）；
+  searchKnn 逐查询 C ABI + 0xffffffff 填充剥离 + max-heap 返回。逐查询 nq=1 →
+  拆分退化全 CPU（引擎计数全 0，wall 210.7s）——吞吐叙事属于批处理用户，正确性
+  不受影响。**集合级门禁**：demo dump（m + 升序 ids + pad）vs engref（提交序）
+  规范化逐行集合等价 1000/1000 PASS——提交序/升序两种结果表示同源同正确。
+  附带修掉 CylonHnsw 析构未定义（无 vtable）链接错。
+- M3-3 **TUTORIAL.md**：§0 环境自检 / §1 C API / §2 FAISS / §2b hnswlib /
+  §3 ctypes / §4 auto-f / §5 约束表 / §6 验收锚点（三语言 + f 扫描 + hnsw 全
+  锚点数字）。notebook 骨架未做（无需求即不做）。
+- 事故记录：6 次"静默死"= 我方脚本 -q 写了宿主镜像路径（guest 真路径
+  /var/tmp/anns_wiki/queries_fp16.bin）+ tail 管道缓冲幻影（stderr 先落、stdout
+  退出刷出顶出 tail 窗口——诊断必须整文件捕获）；真崩溃族 5 次 GPF/SEGV 全部
+  重试存活；取证升级见状态行（确定性错跳签名，D3 门铃 v2 仍是结构解）。
 
 ## 9. 非目标
 

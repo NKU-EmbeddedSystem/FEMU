@@ -3,5 +3,7 @@
 c_min
 cpu_search
 cpu_search_vec
+autof_check
+hnsw_demo
 # session state
 .omc/

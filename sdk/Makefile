@@ -17,7 +17,7 @@ AVXCFLAGS = -O3 -mavx2 -fPIC -pthread -Wall -Wextra -DCYLON_BUILD_AVX=1
 INC      = -I include -I src -I $(PNM_INC)
 LDLIBS   = -lpthread -lm
 
-all: libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min
+all: libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min autof_check
 
 # faiss adapter: needs a conda-forge libfaiss (headers + lib), e.g.
 #   micromamba create -p /tmp/faiss-env -c conda-forge libfaiss
@@ -41,10 +41,20 @@ cpu_search_vec: src/cpu_search_main.c libcylon_avx.so
 c_min: examples/c_min.c libcylon.so
 	$(CC) $(CFLAGS) $(INC) examples/c_min.c libcylon.so -o $@ $(LDLIBS) -Wl,-rpath,'$$ORIGIN'
 
+autof_check: examples/autof_check.c libcylon.so
+	$(CC) $(CFLAGS) $(INC) examples/autof_check.c libcylon.so -w -o $@ $(LDLIBS) -Wl,-rpath,'$$ORIGIN'
+
 faiss_demo: examples/faiss_demo.cpp adapters/faiss/cylon_index.cpp adapters/faiss/cylon_index.hpp include/cylon.h src/cylon_internal.h libcylon.so $(PNM_INC)/pnm_uapi.h
 	$(CXX) -O2 -std=c++17 -I include -I src -I adapters/faiss -I $(PNM_INC) -I $(FAISS_INC) adapters/faiss/cylon_index.cpp examples/faiss_demo.cpp -L. -lcylon -o $@ $(LDLIBS) $(FAISS_LDFLAGS) -Wl,-rpath,'$$ORIGIN'
 
+# hnswlib adapter: header-only (hnswlib 0.8.0 sdist), e.g.
+#   guest: wget the sdist to /tmp/hnsw-inc and extract
+HNSW_INC ?= /tmp/hnsw-inc/hnswlib-0.8.0/hnswlib
+
+hnsw_demo: examples/hnsw_demo.cpp adapters/hnswlib/cylon_hnsw.cpp adapters/hnswlib/cylon_hnsw.hpp include/cylon.h src/cylon_internal.h libcylon.so $(PNM_INC)/pnm_uapi.h
+	$(CXX) -O2 -std=c++17 -I include -I src -I adapters/hnswlib -I $(PNM_INC) -I $(HNSW_INC) adapters/hnswlib/cylon_hnsw.cpp examples/hnsw_demo.cpp -L. -lcylon -o $@ $(LDLIBS) -Wl,-rpath,'$$ORIGIN'
+
 clean:
-	rm -f libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min faiss_demo
+	rm -f libcylon.so libcylon_avx.so cpu_search cpu_search_vec c_min autof_check faiss_demo hnsw_demo
 
 .PHONY: all clean
