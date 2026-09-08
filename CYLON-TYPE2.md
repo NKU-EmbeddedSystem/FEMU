@@ -53,7 +53,8 @@ scalar，dump 全部逐字节=engref；wall 115.1 / 114.4 / 114.2 / 115.6 / 117.
 **"结果拾取对一致性税不敏感"**；knob=5e6（430× 物理）proof 点 +1.8s 浮出机制，每 run
 恰好 jobs+2 次计费（BIND/FLUSH 各一）。负对照 knob=0 在 FEMU 日志层亦 0 条 re-trap。
 **已知限制（2026-09-06 E1'' 后修订）**：两族客户端崩溃，同属"翻译过期竞态 × 客户端
-活跃窗口访问"（D3 信箱 v2 结构性修复对象），引擎与数据路径无责（存活点 dump 全部逐字节
+活跃窗口访问"（E-M 已定案 2026-09-07：**scalar 族被 v2 世界根治 9/9**；**avx 族与
+等待方式无关 10/10 死 → D3' 引擎侧修复对象**），引擎与数据路径无责（存活点 dump 全部逐字节
 =engref）：
 1. **avx #UD 族（0x110b，取指拿错页字节）**：f=0.25 毒点——b250_f025 4/4 死、b500_f025
    2/3 死 + v2 过（重启换 ASLR 复活）→ 非确定性；其余 11 个非-f025 avx 点全绿。
@@ -130,14 +131,26 @@ blob 一致（换 blob 需 fresh boot 或重新 first-touch——verify_window �
 **动机**：现信箱 = 两边轮询裸字（已知 collab GPF 竞态的最大嫌疑，§8.10.4：客户端或
 FEMU 随机中签）。Type-2 提供 Device Atomics + 中断式完成通知，语义上根除轮询竞争。
 
-**实现**：
-- job 插槽状态机改原子 CAS：客户端 `fetch-add` 领号、设备 `fetch-add` 完成计数
-  （FEMU 内模拟原子语义 + 账单延迟 `/tmp/femu-atomic-ns`）。
-- 完成通知：设备对 collab 客户端发 MSI-X（QEMU MSI-X 基建现成；guest 侧 vfio？否——
-  走 ivshmem/门箱中断通道与现有 DER 窗口解耦）。轮询保留为退化路径（开关回退）。
-- **预期副产品**：单写者-单读者槽位 + 原子发布后，重跑 1000+ run 压测观察 GPF 消失。
+**实现（已落地 2026-09-07，Phase 1+2+3 完成；E-M 见 ANALYSIS §5.3）**：
+与原设想两处不同：状态机 = **代际状态字**（u64 = {gen:u32, state:u32}，客户端独占写
+gen，天然消 ABA）而非逐位 CAS；门铃 = **专用最小 PCI 设备**（`hw/femu/cylon/
+doorbell.c`，1b36:bf00，BAR0 仅表+PBA）而非 ivshmem——最干净，不碰 cxl-type3 与
+guest 内核驱动。
+- job 插槽状态机 u64 代际状态字 + 布局双名兼容（旧客户端 gen==0 → 引擎降级 v1
+  语义；旧引擎读低 32 位也照跑新客户端）。G1 门禁过：v1 二进制对 v2 引擎
+  112.485s 逐字节一致。
+- 完成通知：引擎 DONE 发布 + BI retrap 之后 `cylon_doorbell_notify()` → `msix_notify`
+  （专用 PCI 门铃 + guest tiny .ko `/dev/cylon-db` poll/read；轮询保留为退化路径，
+  客户端 `--notify=poll/sleep/doorbell`）。两个投递坑已定案：`msix_vector_use` 缺失
+  = 静默 no-op；**QEMU 用 PCI_COMMAND_MASTER 门控设备 MSI/DMA 地址空间而 Linux
+  MSI 框架不设该位 → .ko 必须 `pci_set_master`**（否则 MSI 写静默消失，QEMU/KVM
+  零报错）。G5 门铃门禁过（114.239s，dump 逐字节 = engref，IRQ 计数 515 证投递）。
+- **预期副产品**：单写者-单读者槽位 + 代际发布后，压测观察 GPF 消失（poll-storm
+  族已在 Phase 0 由 sleep 证实可救；v2 + 门铃把等待方式整个换掉；E-M 电池给死亡率
+  对比）。
 
-**验收**：collab 压测（≥200 run）零 GPF；E1'' 关键点数字与 v1 信箱一致（±噪声）。
+**验收**：G1/G5 逐字节门禁 ✓；E1'' 关键点带内（±3%）；E-M 死亡率 + 时序电池
+（§7）。
 
 ## 6. D4 — DVSEC 外观件（零性能影响，合规性）
 
@@ -151,8 +164,8 @@ FEMU 随机中签）。Type-2 提供 Device Atomics + 中断式完成通知，�
 | 实验 | 变量 | 交付 |
 |---|---|---|
 | E1''-BI | BI ∈ {0,250,500,1000} × E1' 7 点 | ✅ 2026-09-06：17/18 格，BI 维全网格平坦（<±3%），`exp/e1c_paper/e1pp_matrix.csv` |
-| E-S | staging 方式 {first-touch, 设备 RFO} | staging 时间对比图 |
-| E-M | 信箱 v1 轮询 vs v2 原子+MSI-X | GPF 率 + 拾取延迟 |
+| E-S | staging 方式 {first-touch, 设备 RFO} | ✅ 2026-09-06（FTL-prefetch 变体替 RFO，后者 deferred）：冷 2003s→21.1s（**95×**）、restage 520.9s→21.1s（**24.7×**）；搜索侧全点 ±2.8% 带内、recall 0.9720 恒、7/7 dump 逐字节；`exp/e1c_paper/es_results.csv` + `es_staging.png` + ANALYSIS §5.2 |
+| E-M | 信箱 v1 轮询 vs v2 原子+MSI-X | ✅ 2026-09-07：scalar 毒格 9/9 活（含紧自旋臂，v1 同臂 3/3 死）+ avx 毒格 10/10 死（族与等待方式无关，D3' 项）+ G5 门铃门禁 114.239s 逐字节（IRQ 515）；`exp/e1c_paper/em_results.csv` + `em_battery.png` + ANALYSIS §5.3；白话版报告 = `CYLON-D3-EXPLAINED.md` |
 | 全局 | 所有结果类改动 | dump 与 engref 逐字节一致（只改时序的硬门禁） |
 
 ## 8. 非目标

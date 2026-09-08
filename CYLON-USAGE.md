@@ -630,18 +630,105 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
 - wiki_exp.sh 已加 **44000B dump 尺寸门禁**：客户端暴毙产出 0 字节 dump 时该点判无效
   并中止，不再被管道 `|| true` 静默吞掉。
 
-### 8.10.4 已知问题（不阻塞，待查）
-- **collab avx 客户端低频竞态**：每 sweep ~1/7 概率、点位随机，客户端 GPF 野跳转
-  （dmesg `general protection fault`，ip 落在指令流中间 = 控制流被踩）。引擎侧无恙
-  （把已提交 job 做完即空闲），下一点正常恢复；已完成点不受影响（逐字节门禁保证）。
-  处置 = 该点重试即可；根因（邮箱并发路径内存污染）待专项排查。
-- verify-window 恒报 `1 pages differ [p9239448]`：queries 区尾页口径差（staging 写满
-  页 vs verify 按文件 EOF 截断），搜索实际读的字节正确（全部 dump 逐字节一致），暂不修。
+### 8.10.4 已知问题（D3 Phase 0 因果阶梯已定案 2026-09-06）
+
+**两族崩溃，根因分裂**（毒格复现电池 `em_p0.sh`，avx f=0.25@b250 ×4 + scalar f=0.65@1k
+×3，wiki 21M；判读规则：sleep-poll 存活率显著回升 → 轮询风暴参与因果；仍死 → flip/flush
+× 运行中 vCPU）：
+
+1. **avx #UD 族 = KVM 内核模拟器不会解码 VEX（D3-F 取证定案 2026-09-07，ANALYSIS §5.4）**：
+   f=0.25@b250 avx，历史紧自旋 4/4 死（#UD ip 0x110b）；D3 sleep-poll 4/4 死（0x136f =
+   旧构建偏移）；E-M 三等待臂 10/10 死（0x983 = 旧构建偏移；本构建 = 0x2983 =
+   mb_submit+131 `vmovq`）。**根因（非竞态）**：KVM 内嵌 x86 模拟器所有 VEX 处理被注释
+   （emulate.c:1204/4839/5011）→ 任何 VEX 指令触 trap 叶（DUAL 槽 mmio-SPTE）→
+   RET_PF_EMULATE → 解码失败 → emulate_ud → #UD。**"取指拿错页字节"论作废**
+   （core.4389：故障指令 = 真指令 `vmovq %xmm0,(%rax)`，rax = 信箱页）。暴露面 =
+   "trap 叶 × VEX 首触"：启动期 = 上个 run 末次 retrap 落在客户端末次拾取之后
+   （µs 竞态）留下的毒信箱；搜索期 = 数据页驱逐/retrap 后的 VEX 窗口加载。毒药再生
+   竞态解释"非确定性"（E1'' 11/12 绿 vs E-M 10/10 死 = 末次 retrap vs 末次拾取的
+   µs 赛跑）。**修复 = D3-F F5 "bill & re-execute"**：内核在 DUAL 槽 RET_PF_EMULATE
+   处不进模拟器，挂 KVM_EXIT_CYLON_DER(40) 交 QEMU 计费（tail: pin+BI；数据页：FTL
+   计费+翻直，wait_for_buf_update data_ptr=NULL）→ RIP 不变原生重执行（ISA 无关）。
+   计费与 scalar 老路径逐项等价（每 (re)trap 一次），D1 真实翻页机制零改动；同 gpa
+   重试 >3 回退老模拟器路径兜底。**需要 L0 内核 rev -13 + QEMU 重建**；F6 验收 =
+   毒格三等待臂 ×3 重放 + 门禁 + E-M 刷新。
+2. **scalar GPF 族 = 轮询风暴参与因果（sleep 已缓解，门铃治本候选）**：f=0.65@1k
+   scalar，历史紧自旋 3/3 死（GPF ip 0x25d0）；D3 sleep-poll **3/3 活**（146.0/146.1/
+   146.1s 全落 E1'' f065 带，dump 全部逐字节 = engref）→ 客户端紧自旋对信箱页的
+   百万次/s 窗口访问风暴参与因果；50µs 睡眠轮询已消除。v2 门铃（vCPU 阻塞等 IRQ）为
+   该族治本候选；E-M 电池已跑完（2026-09-07）：v2 世界 scalar 毒格 9/9 全活（含紧自旋 poll 臂，wall 143.7–147.4s 全落 f065 带）——**v2 世界该族消失**；CONTROL 臂定案（`ctrl_v1_f065b1000`：v1 协议客户端+紧自旋 对 v2 引擎，fresh boot）= **活 + 146.265s 带内 + dump 逐字节 → 治愈因子在引擎侧**（u64 {gen,DONE} 单 store 发布 + gen 拾取），见 ANALYSIS §5.3。
+
+处置：毒格换客户端补跑（BI 计费与客户端 ISA 无关）；verify-window 恒报 `1 pages
+differ [p9239448]`：queries 区尾页口径差（staging 写满页 vs verify 按 EOF 截断），搜索
+实际读的字节正确（全部 dump 逐字节一致），暂不修。
 
 ### 8.10.5 待做
-- E2'（DER_FLUSH=2 真驱逐 + 小 bufsz）与 E0'（per_dist=1000 重放）在 21M 上重跑；
+- E2'（DER_FLUSH=2 真驱逐 + 小 bufsz）与 E0'（per_dist=1000 三重放）在 21M 上重跑；
 - per_dist 参数微调（已指示暂不做）；NUMA-node 化路线（dax-kmem）已在可行性层面
   评估，待立项。
+
+
+## 8.11 D3：信箱 v2 代际协议 + MSI-X 门铃（2026-09-07 Phase 2 验证通过）
+
+**动机**（v1 轮询信箱 = 两族客户端崩溃的最大嫌疑，§8.10.4）：v2 把信箱
+`status:u32 + reserved:u32` 打包成对齐 u64 状态字（低 32 位状态 IDLE/PENDING/DONE，
+高 32 位 = 客户端独占写的 job 代数），消 ABA；布局双名兼容——旧引擎读低 32 位照跑，
+旧客户端 reserved 恒 0 → 引擎 `gen==0` 特判降级 v1 语义（G1 门禁：v1 二进制对 v2
+引擎 112.485s 逐字节一致）。
+
+**等待模式**（客户端 `--notify=poll|sleep|doorbell`，默认 poll = v1 紧自旋逐比特）：
+- `poll`：v1 紧自旋；`sleep`：自旋 2µs 后 50µs usleep（Phase 0 验证 sleep 免疫
+  scalar 族）。
+- `doorbell`：`poll(/dev/cylon-db)` 阻塞等 IRQ，read 消费计数，状态字复核过滤伪唤醒。
+  vCPU 阻塞而非自旋 = 轮询风暴族（scalar GPF）的根治等待方式。
+
+**门铃设备**（QEMU 侧 `hw/femu/cylon/doorbell.c`，`-device cylon-doorbell`，默认
+不挂载 → notify 为 NULL-check no-op，默认路径逐比特不变）：
+- 最小 PCI 设备（1b36:bf00），`msix_init_exclusive_bar` 1 向量（BAR0 只放表+PBA），
+  引擎线程 DONE 发布 + BI retrap 之后 `cylon_doorbell_notify()` → `msix_notify()`。
+- **坑 1**：`msix_notify()` 对 `msix_entry_used[]==0` 的向量静默 no-op → realize 必须
+  `msix_vector_use(pd, 0)`。
+- **坑 2（根因，排了一整轮）**：QEMU 把设备 DMA/MSI 地址空间门控在
+  `PCI_COMMAND_MASTER`（`bus_master_enable_region` 别名），而 **Linux MSI 框架不设
+  bus master 位** → 不 `pci_set_master()` 则 MSI 写落 unassigned 空间静默消失
+  （QEMU/KVM 全程零报错；`lspci` 显示 `BusMaster-` 即此病）。guest .ko 已修。
+- KVM kernel-irqchip 下投递链 = msix_notify → msi_send_message → kvm-apic-msi
+  region → `KVM_SIGNAL_MSI`；门铃 .ko（`tools/cylon_doorbell.c`，宿主
+  /usr/src/linux-headers-6.4.6-cylon 编译 → scp → **每 boot insmod 一次**）+ misc
+  `/dev/cylon-db`（poll/read 计数）。实测 IRQ 43 计数：NOP ping 0→4，G5 全程 515 次。
+- stage_device 循环（D2 设备 staging）不用门铃（100ms poll + 1h 超时）——仅搜索
+  等待走门铃；残留计数（poll/sleep 臂期间门铃照发）→ 门铃臂首次等待最多一次伪唤醒
+  （状态字复核兜底）。
+
+**旋钮**：
+| 旋钮 | 语义 | 缺省 |
+|---|---|---|
+| `/tmp/femu-doorbell`=1 | launch-time 门铃设备挂载（需重启改） | absent = 关 |
+| `--notify=poll/sleep/doorbell` | 客户端等待模式（协议时序旋钮，数据不变） | poll |
+| `/tmp/femu-atomic-ns` | 引擎读新代 PENDING 计一次 Device-Atomic 账单（E-M 叙事） | 0 = off |
+
+**门禁**：默认旋钮 + 各等待模式 dump 逐字节 = engref（G1 legacy 兼容门禁 112.485s ✓、
+G5 doorbell 114.239s 逐字节 ✓、poll_1 145.721s ✓、G4 协议时序门 112.869s ✓、
+CONTROL v1@v2 引擎 146.265s ✓）；E-M 电池见 ANALYSIS §5.3。
+**门铃臂 wall 判别器**：投递死不会让 run 失败——客户端靠 ~10s/engine-job 门铃等待
+超时兜底走完，wall 膨胀到 5000s+（g5 5004.5s、doorbell_1 7506.9s），dump 仍逐字节
+→ **wall<180s=活 / >5000s=死 是唯一判别器**。
+
+**门铃投递破案（2026-09-07 深夜，"间歇死"真因 = 陈旧 .ko）**：F6 两轮探针 IRQ 0→0
+（含 pin CPU0+停 irqbalance）曾误判为"SIGNAL_MSI 路径本身断"。调试构建取证定案：
+QEMU 侧全链正常（notify fired、表项 0xfee01004/0x23 unmasked used=1），**但零
+SIGNAL_MSI 调用** → `lspci` **BusMaster-** 定罪 → `nm -u` 陈旧 .ko 缺 `pci_set_master`
+符号——**BusMaster 修复（源码 18:54 编辑）从未重编进 .ko（旧构建 18:17）**，历次
+boot 一直在 insmod 无修复的旧模块 → bus_master_enable_region 别名禁用 → MSI 写落
+unassigned 空间静默消失。**重编 .ko 后 BusMaster+ → SIGNAL_MSI ret=1 + IRQ 计数
+上涨，投递复活**。教训：**改 .ko 源码后必须重编并核对 `nm -u` 符号**（修复只进
+源码不重编 = 从未部署）；dump 门禁对投递死不敏感（见上判别器）。
+
+**已知协议边角（2026-09-07 CONTROL 臂首试实证）**：v1 客户端在**脏槽**上会被 v2 引擎
+误判——v1 submit 只写 status u32，gen 半字继承槽内残留（上一客户端的 last gen）≠ 0 →
+引擎走 v2 路径 → gen ≠ last+1 → "stale PENDING ... ignored" 永拒。G1 门禁的隐含条件
+= **fresh slot（新 boot / 槽清零）**；v1 兼容 = "fresh-slot legacy 兼容"。v1 客户端
+务必在 FEMU 重启后的第一个跑（em_p2_bringup.sh 之后）。
 
 
 ## 9. 故障排查

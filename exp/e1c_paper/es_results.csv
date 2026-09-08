@@ -1,0 +1,9 @@
+point,mode,bps,stage_wall_s,search_wall_s,engine_misses_per_q,recall,gate
+es_fresh,ft-fallback-cold,NA,2003.3,112.756,4291.8,0.9720,PASS
+es_t0,dev,0,21.33,110.753,4299.1,0.9720,PASS
+es_t1,dev,2e9,21.08,117.185,4293.5,0.9720,PASS
+es_t1_attempt1,dev,2e9,20.86,NA,NA,NA,CLIENT_DIED_avx_GPF_family_retry_protocol
+es_t2,dev,14e9,25.31,111.534,4294.4,0.9720,PASS
+es_slow,dev,0.5e9,75.69,112.612,4294.7,0.9720,PASS
+es_t5ft,ft-legacy-S,NA,skipped,117.171,4301.1,0.9720,PASS
+es_ft_restage,ft-scalar-full,NA,520.9,113.545,4289.8,0.9720,PASS
