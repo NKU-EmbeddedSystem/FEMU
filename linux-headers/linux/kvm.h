@@ -211,6 +211,17 @@ struct kvm_xen_exit {
 #define KVM_EXIT_LOONGARCH_IOCSR  38
 #define KVM_EXIT_MEMORY_FAULT     39
 
+/*
+ * Cylon DER (D3-F/F5): bill & re-execute exit for DUAL-mode (DER) slots.
+ * The in-kernel x86 emulator cannot decode VEX/AVX, so a vectorized guest
+ * access to a trap leaf died with #UD before the DUAL-slot check ever ran.
+ * This exit hands the raw {gpa, is_write} to FEMU (no decode), FEMU bills
+ * + flips the leaf, and the instruction re-executes natively -- ISA-agnostic
+ * by construction. 40 matches the CylonLinux kernel's uapi (which skips
+ * newer-upstream 38/39 to stay rebase-safe).
+ */
+#define KVM_EXIT_CYLON_DER        40
+
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
 #define KVM_INTERNAL_ERROR_EMULATION	1
@@ -466,6 +477,12 @@ struct kvm_run {
 			__u64 gpa;
 			__u64 size;
 		} memory_fault;
+		/* KVM_EXIT_CYLON_DER (Cylon DER bill & re-execute) */
+		struct {
+			__u64 gpa;
+			__u8  is_write;
+			__u8  pad[7];
+		} cylon_der;
 		/* Fix the size of the union. */
 		char padding[256];
 	};

@@ -52,6 +52,12 @@
 #include "hw/boards.h"
 #include "sysemu/stats.h"
 
+/* Cylon DER (D3-F/F5): bill & re-execute exit handler (implemented in
+ * hw/femu/cylon/cxlssd.c; extern here to keep femu headers out of accel/).
+ * KVM_EXIT_CYLON_DER = DUAL-slot EPT violation, no instruction decode;
+ * FEMU bills + flips, guest re-executes natively. */
+extern int cylon_der_handle_fault(uint64_t gpa, uint8_t is_write);
+
 /* This check must be after config-host.h is included */
 #ifdef CONFIG_EVENTFD
 #include <sys/eventfd.h>
@@ -2920,6 +2926,14 @@ int kvm_cpu_exec(CPUState *cpu)
                              run->mmio.data,
                              run->mmio.len,
                              run->mmio.is_write);
+            ret = 0;
+            break;
+        case KVM_EXIT_CYLON_DER:
+            /* Cylon DER bill & same context as KVM_EXIT_MMIO (outside BQL);
+             * ret = 0 = continue (re-enter: native re-execution). Even on
+             * handler refusal, re-enter: KVM's per-gpa retry cap falls back
+             * to the legacy emulator path (livelock guard). */
+            cylon_der_handle_fault(run->cylon_der.gpa, run->cylon_der.is_write);
             ret = 0;
             break;
         case KVM_EXIT_IRQ_WINDOW_OPEN:

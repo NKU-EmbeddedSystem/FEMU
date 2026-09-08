@@ -402,6 +402,61 @@ static void cylon_bi_charge(uint64_t addr, unsigned size)
     }
 }
 
+/* Singleton for the KVM_EXIT_CYLON_DER handler (kvm-all.c calls in without
+ * a device handle; single CXL-SSD window per VM). Captured at realize. */
+static FemuCtrl *cylon_der_fault_ctrl;
+
+/* D3-F F5: "bill & re-execute" exit handler for KVM_EXIT_CYLON_DER. KVM
+ * exits on a DUAL-slot EPT violation *without decoding* the faulting
+ * instruction (the in-kernel emulator cannot decode VEX/AVX -- the root
+ * cause of the avx #UD family, ANALYSIS §5.4). Bill through the same path
+ * the legacy emulator path uses, so billing semantics stay identical to
+ * scalar (one bill per (re)trap event, real page flips, D1 mechanism
+ * untouched):
+ *   tail pages:  pin direct + BI charge (no data movement -- the re-executed
+ *                access reads/writes logical_space directly);
+ *   data pages:  FTL bill + cache insert + EPTE flip (data_ptr = NULL:
+ *                ftl_thread.c only skips the memcpy; the cache fill and
+ *                flip happen as usual).
+ * Returns <0 on refusal (plain/skip_ftl/uninitialized); the guest then
+ * re-enters and KVM's per-gpa retry cap falls back to the legacy emulator
+ * path. Called outside BQL, same context as the MMIO dispatch path. */
+int cylon_der_handle_fault(uint64_t gpa, uint8_t is_write)
+{
+    FemuCtrl *n = cylon_der_fault_ctrl;
+    Cxlssd *ctx;
+    DerKvmState *s;
+    uint64_t addr;
+
+    if (!n || !n->mbe) {
+        return -1;
+    }
+    ctx = cxlssd_ctx_from_ctrl(n);
+    s = ctx ? ctx->der_kvm : NULL;
+    if (!s || !s->init_done || s->plain || n->cxl_skip_ftl) {
+        return -1;
+    }
+
+    addr = gpa - s->guest_phys_addr;
+    if (addr >= s->memory_size) {
+        return -1;
+    }
+
+    /* Window-tail control page (mailbox/results)? Same predicate as the
+     * legacy trap path (cxlssd_mem_read/write). */
+    if (n->mbe->size - addr <= (uint64_t)DER_TAIL_PIN_PAGES * 4096) {
+        der_kvm_pin_tail_page(ctx, addr >> 12);
+        cylon_bi_charge(addr, 64);
+        return 0;
+    }
+
+    /* Data page: FTL bill + cache insert + EPTE flip; data_ptr = NULL so
+     * ftl_thread.c skips only the memcpy (the fill + flip happen as usual),
+     * and the re-executed instruction proceeds natively. */
+    wait_for_buf_update(n, addr, is_write ? CXL_WRITE : CXL_READ, 64, NULL);
+    return 0;
+}
+
 static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, unsigned size, MemTxAttrs attrs)
 {
     FemuCtrl *n = (FemuCtrl *)opaque;
@@ -536,6 +591,8 @@ static uint16_t set_lsa(struct FemuCtrl *n, const void *buf, uint64_t size, uint
 
 int nvme_register_cxlssd(FemuCtrl *n)
 {
+    cylon_der_fault_ctrl = n; /* KVM_EXIT_CYLON_DER handler (D3-F/F5) */
+
     n->ext_ops = (FemuExtCtrlOps) {
         .state            = NULL,
         .init             = cxlssd_init,

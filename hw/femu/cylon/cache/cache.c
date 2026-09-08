@@ -284,7 +284,17 @@ void cache_destroy(Cache *c)
 CacheEntry *cache_lookup(Cache *c, lpn_t lpn)
 {
     CacheEntry key = { .lpn = lpn };
-    return g_tree_lookup(c->tree, &key);
+    CacheEntry *e;
+
+    /* The PNM engine thread and the FTL thread share this tree. The
+     * formerly unlocked lookup raced insert's evict+free: a hit-path
+     * entry could be freed mid-use and re-inserted with heap garbage
+     * as lpn (non-canonical fill address -> host #GP, the poll_2 GPF).
+     * Every tree access must hold c->lock. */
+    qemu_mutex_lock(&c->lock);
+    e = g_tree_lookup(c->tree, &key);
+    qemu_mutex_unlock(&c->lock);
+    return e;
 }
 
 uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn)
@@ -402,6 +412,20 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest)
     }
 
     if (c->cache_buf && c->nand_buf && c->nr_slots > 0) {
+        /* The entry bounds check ran before the lock; a residual race could
+         * scribble the entry between the two. Refuse cleanly (slot returned
+         * to the free stack; the guest re-traps and refills) instead of
+         * faulting the host on a non-canonical fill address. */
+        if ((uint64_t)entry->lpn >= (uint64_t)(c->nand_size >> 12)) {
+            fprintf(stderr, "!! Cylon cache: insert REFUSED under-lock lpn 0x%llx "
+                    "(entry %p, slot %u)\n", (unsigned long long)entry->lpn,
+                    (void *)entry, entry->slot_id);
+            if (entry->slot_id != UINT32_MAX) {
+                c->free_slots[c->free_top++] = entry->slot_id;
+            }
+            qemu_mutex_unlock(&c->lock);
+            return -1;
+        }
         memcpy((char *)c->cache_buf + (size_t)(entry->slot_id * CACHE_PAGE_SIZE),
                (const char *)c->nand_buf + (size_t)(entry->lpn * CACHE_PAGE_SIZE),
                CACHE_PAGE_SIZE);

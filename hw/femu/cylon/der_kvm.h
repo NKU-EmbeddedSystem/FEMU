@@ -78,6 +78,15 @@ void der_kvm_epte_retrap_control(Cxlssd *ctx, uint64_t lpn);
  * by the PNM thread (live knob), charged in cxlssd.c's tail-page trap path. */
 extern uint64_t cylon_bi_lat_ns;
 uint64_t *der_kvm_get_eptep_dbg(Cxlssd *ctx, uint64_t lpn);
+/* D3-F F5: KVM_EXIT_CYLON_DER "bill & re-execute" handler (called from
+ * accel/kvm/kvm-all.c on a DUAL-slot EPT violation with no instruction
+ * decode). Bills via the same paths as the legacy trap path (tail: pin +
+ * BI charge; data: FTL bill + cache insert + EPTE flip) and leaves the
+ * leaf direct so the guest instruction re-executes natively -- fixes the
+ * avx #UD family (KVM emulator cannot decode VEX) with real flips intact.
+ * Returns <0 on refusal (plain/skip_ftl mode); KVM then falls back to the
+ * legacy emulator path via its per-gpa retry cap. */
+int cylon_der_handle_fault(uint64_t gpa, uint8_t is_write);
 
 int der_kvm_set_user_memory_region(const FemuCtrl *n);
 /* Acceptance/debug mode: register the window as a plain RAM memslot (EPT
