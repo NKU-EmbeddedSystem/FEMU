@@ -154,6 +154,13 @@ db=$(cat /tmp/femu-doorbell 2>/dev/null || true)
 if [ "$db" = "1" ]; then
     CYLON_DB_ARG="bus=pcie.0"
 fi
+# D4: Type-2 device-coherent enumeration on the cxl-type3 device (file knob
+# /tmp/femu-hdm-db = 1; launch-time only; absent/0 = off, byte-identical
+# Type-3 config space).
+hdmdb=$(cat /tmp/femu-hdm-db 2>/dev/null || true)
+if [ "$hdmdb" = "1" ]; then
+    CYLON_HDMDB_ARG=",hdm-db=on"
+fi
 sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     -name "FEMU-CXLSSD-VM" \
     -machine type=q35,accel=kvm,nvdimm=on,cxl=on -enable-kvm \
@@ -171,7 +178,7 @@ sudo -n /home/liz/FEMU/build/qemu-system-x86_64 \
     ${FEMU_OPTIONS} \
     -device pxb-cxl,bus_nr=12,bus=pcie.0,id=cxl.1 \
     -device cxl-rp,port=0,bus=cxl.1,id=root_port13,chassis=0,slot=2 \
-    -device cxl-type3,bus=root_port13,femu=femu-cxlssd,id=cxl-ssd0 \
+    -device cxl-type3,bus=root_port13,femu=femu-cxlssd,id=cxl-ssd0${CYLON_HDMDB_ARG} \
     -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=${ssd_size}M \
     ${CYLON_DB_ARG:+-device cylon-doorbell,bus=pcie.0} \
     -net user,hostfwd=tcp::8080-:22 \

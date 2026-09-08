@@ -731,6 +731,41 @@ unassigned 空间静默消失。**重编 .ko 后 BusMaster+ → SIGNAL_MSI ret=1
 务必在 FEMU 重启后的第一个跑（em_p2_bringup.sh 之后）。
 
 
+## 8.12 D4：Type-2 枚举外观件 hdm-db（2026-09-08 验收通过）
+
+**语义**：`cxl-type3` 新属性 `hdm-db`（默认 off = 历史 Type-3 config space 逐字节
+不变）。on = 设备在 CXL 枚举层面 Type-2（CXL.cache 能力 + device-coherent HDM）：
+(a) Device DVSEC（ID 0）CXL Capability 寄存器 **bit0 CacheCapable=1**（CXL 2.0
+§8.1.3；lspci 显示 `CXLCap: Cache+ IO+ Mem+`）；(b) 组件寄存器 HDM Decoder
+Capability **Supported Coherency Model=3**（host+dev coherent，CXL r3.1 §8.2.4.20.1
+——上游 QEMU `hdm-db=on` 的同款信号，组件寄存器层装饰，对 config-space 工具不可见）。
+上游 hdm-db 另有 BI decoder cap 块 + 强制 flit 链路两件，我们不移植：flit 属链路层
+（emulated link 不承载协议），BI decoder 寄存器对 6.4.6 零消费。CFMWS restrictions
+保持 0x0f（本来就 admits Type-2），不动。
+
+**guest 6.4.6 零消费**：内核只读 cap bit2（MEM_CAPABLE）、bit[5:4]（HDM_COUNT）、
+ctrl bit2（MEM_ENABLE）与 range 寄存器；`parse_hdm_decoder_caps()` 从不读
+coherency-model 字段；drivers/cxl/core 无 coherency 消费点 → region/devdax/搜索
+路径全不变（v1-first G1 门禁实测逐字节 + wall 带内）。
+
+**实现**：`cxl_device.h` `hdmdb` 位 + `cxl_type3.c` build_dvsecs cap `0x1e→0x1f`、
+ct3d_reset `SUPPORTED_COHERENCY_MODEL=3`（字段头文件已有，只补写值）；
+run-cxlssd.sh 文件旋钮 → `-device ...,hdm-db=on`。
+
+**旋钮**：
+| 旋钮 | 语义 | 缺省 |
+|---|---|---|
+| `/tmp/femu-hdm-db`=1 | launch-time Type-2 枚举（需重启改） | absent = 关（Type-3） |
+
+**验收（2026-09-08）**：重启 + bringup 后 guest `lspci -xxxx` diff vs
+`/tmp/d4_enum_off_baseline.txt` = **恰好 1 字节 @0x10A `0x1e→0x1f`**（lspci 解码
+`CXLCap: Cache+`）；region/devdax 不变；v1-first G1 gate 逐字节 + wall 带内
+（114.967s，fresh-boot ft staging 2490s 后首跑；v1 快照二进制不带 `-S`——那是
+现行客户端的 skip-stage 旗标，v1 无 staging 检查直接读零窗口报 bad magic）。
+**已知怪癖**：guest python sysfs-mmap 直读 BAR0 组件寄存器返回全零（BAR2 device
+regs 同法可读、内核侧 region 机制工作正常证明 HDM 块活）——读通路未查明，验证
+HDM 寄存器不要走这条路。
+
 ## 9. 故障排查
 
 | 症状 | 原因/处理 |

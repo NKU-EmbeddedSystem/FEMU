@@ -1,6 +1,7 @@
 # CYLON-TYPE2 路线图 — CXL Type-2（设备一致内存 + CXL.cache）扩展
 
-状态：**规划文档**（本分支 cylon-v9.1-type2，自 cylon-v9.0.1 @2e32446c2 分出，尚无代码）。
+状态：**D1-D4 全部实现并验收（D4 收官 2026-09-08，roadmap 完成）**。
+本分支 cylon-v9.1-type2，自 cylon-v9.0.1 @2e32446c2 分出。
 主实验线仍在 cylon-v9.0.1（Phase C：21M×768d wiki_dpr_e5，E1' 已收官）。
 引用背景见 CYLON-USAGE.md §8.9.8（真实器件锚定）与 §8.10（Phase C）。
 
@@ -152,12 +153,38 @@ guest 内核驱动。
 **验收**：G1/G5 逐字节门禁 ✓；E1'' 关键点带内（±3%）；E-M 死亡率 + 时序电池
 （§7）。
 
-## 6. D4 — DVSEC 外观件（零性能影响，合规性）
+## 6. D4 — Type-2 枚举外观件（零性能影响，合规性；✅ 2026-09-08 验收）
 
-- 设备模型从 cxl-type3 fork：加 **CXL.cache DVSEC**、**Device-Coherent Memory
-  (HDM-DB) DVSEC**，CFMWS 把 region 标 device-coherent。
-- guest 内核基本无感（BI 参与在硬件层）；devdax 路径不变。
-- 只为"设备在 CXL 枚举层面像 Type-2"的论文可信度；可最后做或声明建模范围即可。
+- 设备模型从 cxl-type3 fork：加 CXL.cache DVSEC、Device-Coherent Memory
+  (HDM-DB) DVSEC，CFMWS 把 region 标 device-coherent（roadmap 原文）。
+- **取证修正（2026-09-07，上游源码定案）**：CXL 生态里两者**均非独立 DVSEC**。
+  CXL.cache 能力 = Device DVSEC（ID 0）cap 寄存器 **bit0 CacheCapable**
+  (CXL 2.0 8.1.3；Type-1/2 有 CXL.cache，Type-3 只有 CXL.mem）；HDM-DB 不是
+  DVSEC——upstream QEMU master 的 `hdm-db=on` 全部语义 = 组件寄存器层 HDM
+  Decoder Capability 的 **Supported Coherency Model=3**（host+dev coherent）+
+  r3.2 BI decoder cap 块 + 强制 256B flit 链路（flit 属链路层，我们链路不承载
+  协议 → 不设 gate）。Linux 至 v6.19 无任何 HDM-DB DVSEC ID；guest 6.4.6 只读
+  cap bit2（MEM_CAPABLE）、bit[5:4]（HDM_COUNT）与 ctrl bit2（MEM_ENABLE）→
+  对这些装饰**零消费**。CFMWS restrictions 已是 0x0f（admits Type-2），不动。
+- **实现（2026-09-07）**：`cxl_device.h` CXLType3Dev 加 `hdmdb` 位；
+  `cxl_type3.c` build_dvsecs cap `0x1e→0x1f`（bit0）+ ct3d_reset 里
+  `SUPPORTED_COHERENCY_MODEL=3`（字段本地头文件已有，只补写值）；属性
+  **`hdm-db` 新属性，默认 off** = 历史 Type-3 config space 逐字节不变；
+  run-cxlssd.sh 文件旋钮 `/tmp/femu-hdm-db=1` → `-device ...,hdm-db=on`
+  （launch-time only，镜像门铃旋钮模式）。
+- guest 内核对两处装饰零消费 → devdax/region 路径不变；论文叙事："hdm-db=on
+  一开，设备在 CXL 枚举层面 Type-2"。
+- **验收门禁**：重启 + em_p2_bringup 后 (a) guest `lspci -xxxx` diff vs
+  重启前基线 `/tmp/d4_enum_off_baseline.txt` = 恰好 DVSEC-0 cap @0x10A 一个
+  字节差 0x1e→0x1f；(b) setup_cxl.sh region/devdax unchanged + v1-first G1 gate
+  逐字节 + wall 带内。
+- **验收结果（2026-09-08 全过）**：(a) diff 恰好 1 字节 @0x10A `0x1e→0x1f`，
+  lspci 语义解码 `CXLCap: Cache+ IO+ Mem+`（CacheCapable 位工具可读）；设备
+  枚举/绑定照旧。(b) region/devdax 正常；v1-first G1（fresh boot，ft staging
+  2490s）dump 逐字节 = engref，search wall 114.967s 带内（g1_legacy 113.5s）。
+  组件寄存器侧（coherency=3）为代码审读 + 内核功能性侧证（region 机制工作 =
+  内核读同块 HDM cap 成功）；guest python sysfs 直读 BAR0 返回全零属读通路
+  怪癖（BAR2 同法可读），验证 HDM 寄存器勿走此路。改动 = 5 文件 +93/-8。
 
 ## 7. 实验矩阵与验收总门禁
 

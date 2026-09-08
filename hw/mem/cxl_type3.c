@@ -314,8 +314,16 @@ static void build_dvsecs(CXLType3Dev *ct3d)
                          (size & 0xF0000000);
     }
 
+    /*
+     * Cylon D4: hdm-db=on advertises CXL.cache (CacheCapable, bit 0 of the
+     * DVSEC CXL Capability register, CXL 2.0 8.1.3) turning the Type-3
+     * identity into Type-2 (cache + mem + device-coherent HDM). Guest
+     * 6.4.6-cylon reads only bit 2 (MEM_CAPABLE) and bits 5:4 (HDM_COUNT),
+     * so this bit is enumeration-only there. Default off keeps the
+     * historical Type-3 config space byte-identical.
+     */
     dvsec = (uint8_t *)&(CXLDVSECDevice){
-        .cap = 0x1e,
+        .cap = ct3d->hdmdb ? 0x1f : 0x1e,
         .ctrl = 0x2,
         .status2 = 0x2,
         .range1_size_hi = range1_size_hi,
@@ -955,6 +963,19 @@ static void ct3d_reset(DeviceState *dev)
     uint32_t *write_msk = ct3d->cxl_cstate.crb.cache_mem_regs_write_mask;
 
     cxl_component_register_init_common(reg_state, write_msk, CXL2_TYPE3_DEVICE);
+    if (ct3d->hdmdb) {
+        /*
+         * Cylon D4 (hdm-db=on): CXL r3.1 8.2.4.20.1 HDM Decoder Capability
+         * "Supported Coherency Model" = 3 (host + device coherent) — the
+         * same signal upstream QEMU sets for hdm-db. Component-register
+         * level (BAR), invisible to config-space tooling; guest 6.4.6
+         * parse_hdm_decoder_caps() never reads this field. No flit-mode
+         * gate: unlike upstream we model CXL.cache at transaction level,
+         * the emulated link carries no flits.
+         */
+        ARRAY_FIELD_DP32(reg_state, CXL_HDM_DECODER_CAPABILITY,
+                         SUPPORTED_COHERENCY_MODEL, 3);
+    }
     cxl_device_register_init_t3(ct3d);
 
     /*
@@ -980,6 +1001,8 @@ static Property ct3_props[] = {
                      HostMemoryBackend *),
     DEFINE_PROP_LINK("femu", CXLType3Dev, femu, TYPE_FEMU, FemuCtrl *),
     DEFINE_PROP_UINT64("sn", CXLType3Dev, sn, UI64_NULL),
+    /* Cylon D4: Type-2 device-coherent enumeration (default off) */
+    DEFINE_PROP_BOOL("hdm-db", CXLType3Dev, hdmdb, false),
     DEFINE_PROP_STRING("cdat", CXLType3Dev, cxl_cstate.cdat.filename),
     DEFINE_PROP_END_OF_LIST(),
 };

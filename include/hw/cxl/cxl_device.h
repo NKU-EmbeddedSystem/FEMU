@@ -433,6 +433,8 @@ struct CXLType3Dev {
     HostMemoryBackend *lsa;
     struct FemuCtrl *femu;  /* Cylon: optional FEMU CXL-SSD backend */
     uint64_t sn;
+    /* Cylon D4: Type-2 device-coherent enumeration (hdm-db=on) */
+    bool hdmdb;
 
     /* State */
     AddressSpace hostvmem_as;
