@@ -51,7 +51,7 @@ cache_hpa_base=0x2000000000
 # CXL-SSD DRAM buffer parameters
 policy=2 # Replacement policy [1:LIFO 2:FIFO 3:S3FIFO 4:CLOCK]
 prf_dg=0 # Next-n Prefetch degree
-der_flush=1 # FEMU_DER_FLUSH [0:off 1:guest-origin misses only 2:always=collab]
+der_flush=2 # FEMU_DER_FLUSH [0:off 1:engine-only DSE opt-in (UNSOUND with collab: engine-origin evictions skip the guest flush) 2:always=default]
 comp_dly=0 # engine per-dist compute ns (device compute knob; live-tunable: /tmp/femu-compute-ns)
 bi_lat=0 # D1 Type-2 BI snoop ns (CXL.cache coherence bill; live-tunable: /tmp/femu-bi-lat-ns; 0 = Type-3 off)
 

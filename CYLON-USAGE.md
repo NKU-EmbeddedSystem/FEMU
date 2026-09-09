@@ -582,6 +582,56 @@ QPS ≈ 1/(3.97ms + 3517·per_dist)。落位后据此选"真实感"工作点重�
   占用，干扰画像需重测）在选定工作点（推荐 v=1000）重跑。
 
 
+### 8.9.8 D3''：SDK GPF 崩溃族破案 = der_flush=1 驱逐不 flush（2026-09-08 取证闭环 + 修复）
+
+**现象**：M1-M3 SDK 战役 ~15 run 中 6 次 GPF/SIGSEGV（标量 ip=libcylon.so 基址+0x18f8 /
+avx +0x1978 = .rela.plt 尾零填充确定性落点），全部重试存活、dump 门禁不受影响——
+"概率性崩溃族"长期未破。D3'' 战役用最高速率格（b1000、BI 250、f=0.5）core dump 取证
+（/tmp/d3pp/ 全套证物 + g295 db 图像核证），链路全通：
+
+- **崩溃链**：引擎 PNM 线程 miss → `cylon_cache_insert` 驱逐 victim（guest=false，
+  mode 1 跳过 guest flush）→ 槽被回收重填 → guest vCPU 仍持有 victim 页的直翻译
+  （direct EPT TLB）→ 后续直读把**新住户字节当旧页内容** → 邻居 id = 向量位错读
+  （垃圾 id 0xa7d82713 = 2,815,960,851 = (rbx−st.graph−g_off_vectors)/1536 精确
+  反解，fp16 对解码 = e5 嵌入值，与引擎侧旧案 0x51E04A00 同签名）→ `pnm_dist`
+  按垃圾 id 算向量地址 = 非规范地址（144.6TB）→ GPF（ip=cpu_worker+848
+  `movzwl (%rbx,%r8,2)`，rsp 低 12 位 0xd90 与全部 7 例历史 dmesg 一致）。
+- **为何 mode 1 不健全（原理级）**：引擎观察不到 guest 直读（直读完全绕过 trap），
+  无法知道哪些 victim 页 vCPU 还持有直翻译；"miss 来源"是错误的 flush 判据，
+  **victim 的 guest 驻留性**才是，而它不可计算 → guest 可见 DER 窗口 + collab 的
+  唯一健全默认 = 每驱逐必 flush（mode 2）。mode 1 仅剩"引擎独占 DSE（无 CPU worker）
+  显式选入"一种合法用途。
+- **考古闭环**：9/4 USAGE §8.9.6 E2b 负对照（256M/FIFO/标量/collab f=0.5，唯一变量
+  der_flush=1 → BIND 后 SIGSEGV 1/1，当时结论"collab 必须 der_flush=2"）——教训当时
+  就写下了，但 run-cxlssd.sh 默认从未改（自 2e32446c2 起 mode 1 遗留至今），M1-M3
+  全部跑在错误默认上。E-M 电池 21/21 存活 vs SDK 6/15 的不对称 = 概率性竞态
+  （崩溃率 ∝ 引擎 miss 驱逐率 × victim 正被 vCPU 直读的重叠），f=0.65 臂引擎读少
+  → 死亡少；E2b 是 256M 极端搅动 = 1/1。
+- **修复（三处）**：①der_kvm.c 默认 fallback 1→2 + mode 注释重写（mode 1 标注
+  UNSOUND with collab）；②run-cxlssd.sh `der_flush=2` 默认 + 注释（mode 1 = 引擎独占
+  DSE 选入）；③cache.c 驱逐 flush 注释纠正（删"引擎侧 miss 可跳过 flush"的错误
+  理由）。QEMU 重建 md5 58e835c8，11:01 重启（首启踩宿主内存碎片 dualslot 半分配坑，fadvise 回收 54GB 后 11:18 干净重启装机）。
+- **验收电池（2026-09-08）**：fresh boot + BI 250 + b1000，f=0.5 ×5 + f=0.65 ×2 +
+  auto ×1 共 8 run——目标 8/8 存活 + dump 全部逐字节 == engref（ec3059fb…）。
+  **结果：8/8 rc=0、8/8 dump md5 == ec3059fb…（唯一值，md5sum uniq -c = 8）、零崩溃——
+  历史同格（b1000/BI 250）SDK 战役 6/15 GPF 的崩溃族在 mode 2 下归零。**
+  wall（脚本墙，含 load）：t1=2110.5s = 冷启 ft-staging（重启后 maptbl 空 → 设备
+  stage 覆盖 0 → 逐字节回退重写 36GB，~33min，重启后首 run 固有成本，非回归）；
+  t2-t5=210.7/209.3/208.7/207.8s、f065=217.7/215.7s、auto=210.1s（auto-f 收敛
+  f*=0.547，CONVERGED）。
+- **mode 2 代价（本次电池新量化）**：①STAGE 路径 78-80s vs 历史 ~19s（512MB cache
+  装 9.2M 页 = ~9.07M 次驱逐 × 每次 KVM_DER_FLUSH_TLB ioctl）= **装载段 +60s 税**；
+  ②搜索段 wall 128.1-137.5s vs 历史 113-117s（f=0.5）/135s（f=0.65）= +13-16%，
+  与 E2 量得的 mode-2 干扰方向一致。两处都是吞吐税不是正确性税：md5 门禁 8/8 全过。
+  （DSE 引擎独占跑法想免税 → mode 1 显式选入，条件 = 无 guest 窗口读者。）
+- **判别器不变量（保留）**：dump 门禁对崩溃不敏感（崩溃后重试存活、数据确定性
+  不变）；wall<180s=活 / >5000s=死只适用于门铃投递判定。
+- **流程教训**：a) FEMU 重启后 guest /tmp 全丢——SDK 重部署是独立流程（bringup
+  只重编 /tmp/ 下 cpu_search 四档），必须 repo sdk/ → 镜像（**镜像 = repo sdk/ +
+  pnm_uapi.h，rsync --delete 会把它删掉**，必须补回）→ tar+scp → guest make；
+  b) core dump 取证三件套：guest core_pattern（/var/core/core.%p.%e）、
+  `ulimit -c unlimited`、root core 须 sudo cp + chmod 644 才能取回。
+
 ## 8.10 Phase C：21M×768d 真实语料规模验证（2026-09-05 完成 E1'）
 
 ### 8.10.1 数据集与建图

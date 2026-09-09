@@ -391,11 +391,13 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest)
      * userspace alias, invisible to KVM). Flush the vCPU EPT TLBs BEFORE the
      * freed slot is refilled below, so a stale read of the victim page traps
      * into the (correct) FTL path instead of silently returning the new
-     * occupant's data. Guest-origin misses must flush (the vCPU reads the
-     * window through these EPTEs); engine-origin misses can skip the flush —
-     * host-side cache reads bypass EPT, so the DSE miss model (misses x
-     * pg_rd_lat) stays free of this host-only IPI artifact (FEMU_DER_FLUSH=2
-     * forces always-on, e.g. for collaborative CPU+engine runs). */
+     * occupant's data. Flush is unconditional (mode 2 default): the engine
+     * cannot observe guest direct reads (they bypass traps), so it cannot
+     * tell which victims a vCPU still holds translations for — skipping the
+     * flush on engine-origin misses served the new occupant's bytes through
+     * the stale translation (D3'' SDK GPF family, 2026-09-08; E2b negative
+     * control). Mode 1 (FEMU_DER_FLUSH=1) remains an explicit engine-only
+     * DSE opt-in that is only sound with NO guest window reader. */
     if (evicted) {
         der_kvm_flush_tlbs(ctx, guest);
     }

@@ -243,14 +243,22 @@ int der_kvm_flush_tlbs(Cxlssd *ctx, bool guest)
                 fclose(f);
             }
         }
-        mode = e ? atoi(e) : 1;
+        mode = e ? atoi(e) : 2;
         if (mode < 0 || mode > 2) {
-            mode = 1;
+            mode = 2;
         }
     }
-    /* 0 = off; 1 = guest-origin misses only (engine reads bypass EPT, so
-     * their evictions can skip the flush — keeps the engine miss model
-     * free of this host-only IPI overhead); 2 = always */
+    /* 0 = off; 1 = guest-origin misses only; 2 = always (default).
+     * Mode 1 is UNSOUND whenever the window is guest-visible with a
+     * concurrent CPU worker: the engine cannot observe guest direct reads
+     * (they bypass traps entirely), so it cannot know which victim pages a
+     * vCPU still holds direct translations for. Any engine-origin eviction
+     * of a guest-resident page then serves the new occupant's bytes through
+     * the stale translation (D3'': SDK GPF family, 2026-09-08 core-forensics
+     * closure, same root as the E2b negative control). Mode 1 remains an
+     * explicit opt-in for engine-only DSE runs with NO CPU worker (no guest
+     * window reader exists, so no flush is needed); 2 = always for
+     * anything with a collab component. */
     if (mode == 0 || (mode == 1 && !guest)) {
         return 0;
     }

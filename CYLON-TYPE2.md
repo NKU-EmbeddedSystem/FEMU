@@ -53,9 +53,10 @@ scalar，dump 全部逐字节=engref；wall 115.1 / 114.4 / 114.2 / 115.6 / 117.
 （CXL.cache snoop 200-400ns）内账单 <0.05% wall（淹没在 ±2s 噪声带），结论成立 =
 **"结果拾取对一致性税不敏感"**；knob=5e6（430× 物理）proof 点 +1.8s 浮出机制，每 run
 恰好 jobs+2 次计费（BIND/FLUSH 各一）。负对照 knob=0 在 FEMU 日志层亦 0 条 re-trap。
-**已知限制（2026-09-06 E1'' 后修订）**：两族客户端崩溃，同属"翻译过期竞态 × 客户端
+**已知限制（2026-09-06 E1'' 后修订；avx 族 2026-09-07 已由 D3-F F5 治愈，见 §5.4/USAGE §8.10.4）**：两族客户端崩溃，同属"翻译过期竞态 × 客户端
 活跃窗口访问"（E-M 已定案 2026-09-07：**scalar 族被 v2 世界根治 9/9**；**avx 族与
-等待方式无关 10/10 死 → D3' 引擎侧修复对象**），引擎与数据路径无责（存活点 dump 全部逐字节
+等待方式无关 10/10 死 → 随后 D3-F F5 "bill & re-execute" 治愈**（真因 = KVM 模拟器
+不解码 VEX；F6 验收毒格 9/9 活 + 电池 21/21 PASS）），引擎与数据路径无责（存活点 dump 全部逐字节
 =engref）：
 1. **avx #UD 族（0x110b，取指拿错页字节）**：f=0.25 毒点——b250_f025 4/4 死、b500_f025
    2/3 死 + v2 过（重启换 ASLR 复活）→ 非确定性；其余 11 个非-f025 avx 点全绿。
@@ -192,7 +193,7 @@ guest 内核驱动。
 |---|---|---|
 | E1''-BI | BI ∈ {0,250,500,1000} × E1' 7 点 | ✅ 2026-09-06：17/18 格，BI 维全网格平坦（<±3%），`exp/e1c_paper/e1pp_matrix.csv` |
 | E-S | staging 方式 {first-touch, 设备 RFO} | ✅ 2026-09-06（FTL-prefetch 变体替 RFO，后者 deferred）：冷 2003s→21.1s（**95×**）、restage 520.9s→21.1s（**24.7×**）；搜索侧全点 ±2.8% 带内、recall 0.9720 恒、7/7 dump 逐字节；`exp/e1c_paper/es_results.csv` + `es_staging.png` + ANALYSIS §5.2 |
-| E-M | 信箱 v1 轮询 vs v2 原子+MSI-X | ✅ 2026-09-07：scalar 毒格 9/9 活（含紧自旋臂，v1 同臂 3/3 死）+ avx 毒格 10/10 死（族与等待方式无关，D3' 项）+ G5 门铃门禁 114.239s 逐字节（IRQ 515）；`exp/e1c_paper/em_results.csv` + `em_battery.png` + ANALYSIS §5.3；白话版报告 = `CYLON-D3-EXPLAINED.md` |
+| E-M | 信箱 v1 轮询 vs v2 原子+MSI-X | ✅ 2026-09-07：scalar 毒格 9/9 活（含紧自旋臂，v1 同臂 3/3 死）+ avx 毒格 10/10 死（与等待方式无关；随后 D3-F F5 治愈：F6 毒格 9/9 活 + 电池 21/21 PASS）+ G5 门铃门禁 114.239s 逐字节（IRQ 515）；`exp/e1c_paper/em_results.csv` + `em_battery.png` + ANALYSIS §5.3；白话版报告 = `CYLON-D3-EXPLAINED.md` |
 | 全局 | 所有结果类改动 | dump 与 engref 逐字节一致（只改时序的硬门禁） |
 
 ## 8. 非目标

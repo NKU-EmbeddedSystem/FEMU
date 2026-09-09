@@ -29,7 +29,12 @@ stage_buf memcpy 源指针步进翻倍 + 堆越界读（教训 = 手写数据面
 f065×3）= 崩溃族概率性复现（全部重试存活，数据确定性不受影响）；M3 取证升级：
 GPF ip 恒落 libcylon.so 加载基址 +0x18f8（avx +0x1978）= .rela.plt 尾→.init 间
 零填充（R 段 ELF 元数据，代码改动不动它）——跨客户端/跨重建/跨 ASLR 确定性落点
-= 确定性错跳而非随机踩踏（ip−vm_start < .text 起点 = 控制流转移证据）；教训：
+= 确定性错跳而非随机踩踏（ip−vm_start < .text 起点 = 控制流转移证据）。
+**破案闭环（2026-09-08 D3''，USAGE §8.9.8）**：根因 = der_flush=1（引擎侧驱逐跳过
+guest TLB flush）→ 驱逐后 vCPU 陈旧直翻译把新住户字节当旧页内容 → 垃圾邻居 id =
+向量位错读 → pnm_dist 非规范地址 GPF——与 9/4 E2b 负对照同根；修复 = 全局默认
+der_flush=2（der_kvm.c fallback + run-cxlssd.sh + cache.c 注释，QEMU 58e835c8），
+验收电池 8 run 见 §8.9.8。教训：
 诊断输出必须整文件捕获（`2>&1 | tail -N` 的 stderr 先落 + stdout 退出刷出会把
 报错行顶出窗口 = "静默死"幻影）。四决策不变：①cpu_search
 平移进 sdk/（搬家而非复制，splitter = sdk/tools/split_cpu_search.py）；②适配器
@@ -337,7 +342,7 @@ struct CylonIndex : faiss::Index {
 - 事故记录：6 次"静默死"= 我方脚本 -q 写了宿主镜像路径（guest 真路径
   /var/tmp/anns_wiki/queries_fp16.bin）+ tail 管道缓冲幻影（stderr 先落、stdout
   退出刷出顶出 tail 窗口——诊断必须整文件捕获）；真崩溃族 5 次 GPF/SEGV 全部
-  重试存活；取证升级见状态行（确定性错跳签名，D3 门铃 v2 仍是结构解）。
+  重试存活；取证升级见状态行（确定性错跳签名——注意 F5/v2 双治愈栈上仍现，与两已治愈族签名均不同，未破案）。
 
 ## 9. 非目标
 
