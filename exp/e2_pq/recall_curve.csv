@@ -1,0 +1,14 @@
+# AiSAQ reproduction — recall data from the host reference searcher (S1.5)
+# 1000 NQ queries, k=10, PQ16x8 (16x256x48d), wiki_dpr_e5 21,015,300 x 768d fp16
+# (1) adc-graph: ADC-routing graph walk (res heap = ef), rerank top-R (R=ef)
+# (2) oracle-R: oracle ADC ranking of ALL 21M codes, rerank top-R — measures
+#     how coarse the ADC ranking is (the R-knee / rank-coarseness finding)
+ef,arm,recall_at_10
+100,adc-graph,0.2800
+512,adc-graph,0.4540
+1024,adc-graph,0.5310
+2048,adc-graph,0.6110
+4096,adc-graph,0.6980
+100,oracle-R,0.40
+1000,oracle-R,0.78
+10000,oracle-R,1.00
