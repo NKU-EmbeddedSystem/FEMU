@@ -88,8 +88,10 @@ int cylon_cache_backend_init(FemuCtrl *n, CylonCacheBackend *out)
     }
 
     if (mlock(p, (size_t)csize) != 0) {
+        int saved = errno;
         munmap(p, (size_t)csize);
-        femu_err("Failed to mlock cache backend\n");
+        femu_err("Failed to mlock cache backend (len %lld): %s\n",
+                 (long long)csize, strerror(saved));
         return -1;
     }
 
@@ -310,6 +312,19 @@ uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn)
     return slot;
 }
 
+void cylon_cache_pin_entry(Cache *c, lpn_t lpn)
+{
+    CacheEntry key = { .lpn = lpn };
+    CacheEntry *e;
+
+    qemu_mutex_lock(&c->lock);
+    e = g_tree_lookup(c->tree, &key);
+    if (e) {
+        e->pinned = true;
+    }
+    qemu_mutex_unlock(&c->lock);
+}
+
 /* High-level insert: eviction (epte_set_trap + flush), memcpy, epte_set_direct, then policy insert */
 int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest)
 {
@@ -459,6 +474,13 @@ int cylon_cache_insert(Cache *c, CacheEntry *entry, int prefetch, bool guest)
  * on the same FEMU starts from a cold, coherent cache — leftover direct
  * EPTEs from the previous run would otherwise let guest staging bypass the
  * FTL entirely (observed: 3s staging + BIND bad magic). */
+static gboolean cache_reset_clear_pin(gpointer key, gpointer value,
+                                      gpointer data)
+{
+    ((CacheEntry *)value)->pinned = false;
+    return FALSE;   /* keep walking */
+}
+
 void cylon_cache_reset(Cache *c)
 {
     struct ssd *ssd = cache_get_ssd(c);
@@ -469,6 +491,10 @@ void cylon_cache_reset(Cache *c)
     }
 
     qemu_mutex_lock(&c->lock);
+    /* clear pins first: a pinned AiSAQ codes region must die with the
+     * reset (slots included), or the evict paths return NULL early and the
+     * full-stack rebuild below would double-claim live slots */
+    g_tree_foreach(c->tree, cache_reset_clear_pin, NULL);
     for (int s = 0; s < c->nr_sets; s++) {
         CacheSet *set = &c->sets[s];
         while (set->count > 0) {

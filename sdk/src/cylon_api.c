@@ -284,8 +284,8 @@ cylon_status cylon_load(cylon_ctx *ctx)
 
     /* CYH1 header + traversal state (verbatim setup from the CLI flow) */
     hdr = (struct cyh1_header *)win;
-    if (hdr->magic != CYH1_MAGIC) {
-        fprintf(stderr, "cylon: bad CYH1 magic %08x\n", hdr->magic);
+    if (hdr->magic != CYH1_MAGIC && hdr->magic != CYH2_MAGIC) {
+        fprintf(stderr, "cylon: bad CYH magic %08x\n", hdr->magic);
         return CYLON_ST_EINVAL;
     }
     st.graph = win;
@@ -504,6 +504,9 @@ cylon_status cylon_search(cylon_ctx *ctx, cylon_prec prec,
         stats->n_hops = g_e_hops;
         stats->n_pages = g_e_pages;
         stats->engine_ns = g_e_ns;
+        stats->n_rerank = g_e_rerank;
+        stats->n_code_pages = g_e_code_pages;
+        stats->n_vector_pages = g_e_vec_pages;
     }
 
     /* auto-f: batch-level max-model update, f_new = t_e / (t_c + t_e) with

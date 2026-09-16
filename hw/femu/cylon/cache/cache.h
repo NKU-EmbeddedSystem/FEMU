@@ -25,6 +25,7 @@ typedef uint64_t lpn_t;
 typedef struct CacheEntry {
     lpn_t lpn;
     bool dirty;
+    bool pinned;        /* eviction-proof (AiSAQ A1 codes region) */
     void *policy_data;
     uint32_t slot_id;   /* index into cache_backend (prealloc) for this page */
     QTAILQ_ENTRY(CacheEntry) entry;
@@ -95,6 +96,11 @@ void cylon_cache_reset(Cache *c);
  * cache_lookup() the returned value stays valid after the lock is dropped
  * (no dangling CacheEntry pointer if the FTL thread evicts the page). */
 uint32_t cylon_cache_lookup_slot(Cache *c, lpn_t lpn);
+
+/* Mark a resident page pinned: policies skip it as an eviction victim.
+ * Missing page = no-op (the caller inserts first). Cleared by
+ * cylon_cache_reset with everything else. */
+void cylon_cache_pin_entry(Cache *c, lpn_t lpn);
 
 /* Set backends for NAND <-> cache_backend memcpy (call after create) */
 void cache_set_backend(Cache *c, void *cache_buf, int64_t cache_buf_size,

@@ -160,13 +160,21 @@ static CacheEntry *evict_main(Cache *cache, CacheSet *set, int ent_max)
     CacheEntry *victim = NULL;
 
     if (!sp) return NULL;
-    while (1) {
+    uint32_t scanned = 0;
+    uint32_t n = sp->cnt_main > 0 ? (uint32_t)sp->cnt_main : 0;
+    while (scanned++ < n + 1) {
         victim = QTAILQ_LAST(&set->queue);
         if (!victim) {
             return NULL;
         }
         QTAILQ_REMOVE(&set->queue, victim, entry);
 
+        if (victim->pinned) {
+            /* rotate past the pin (same move as the freq>0 refresh),
+             * bounded: an all-pinned main queue has no victim */
+            QTAILQ_INSERT_HEAD(&set->queue, victim, entry);
+            continue;
+        }
         if (s3fifo_get_freq(victim->policy_data) > 0) {
             freq_dec(victim);
             QTAILQ_INSERT_HEAD(&set->queue, victim, entry);
@@ -176,6 +184,7 @@ static CacheEntry *evict_main(Cache *cache, CacheSet *set, int ent_max)
             return victim;
         }
     }
+    return NULL;    /* bounded scan exhausted: all-pinned main queue */
 }
 
 /* List/metadata only; returns victim. When adding to ghost, use a new lpn-only entry; caller returns original. */
@@ -186,12 +195,20 @@ static CacheEntry *evict_small(Cache *cache, CacheSet *set, int ent_max)
     CacheEntry *victim = NULL;
 
     if (!sp) return NULL;
-    while (1) {
+    uint32_t scanned = 0;
+    uint32_t n = sp->cnt_small > 0 ? (uint32_t)sp->cnt_small : 0;
+    while (scanned++ < n + 1) {
         victim = QTAILQ_LAST(&sp->small);
         if (!victim) {
             return NULL;
         }
         QTAILQ_REMOVE(&sp->small, victim, entry);
+
+        if (victim->pinned) {
+            /* rotate past the pin, bounded; counts untouched */
+            QTAILQ_INSERT_HEAD(&sp->small, victim, entry);
+            continue;
+        }
         sp->cnt_small--;
 
         if (s3fifo_get_freq(victim->policy_data) > 1) {
@@ -208,6 +225,7 @@ static CacheEntry *evict_small(Cache *cache, CacheSet *set, int ent_max)
             return victim;
         }
     }
+    return NULL;    /* bounded scan exhausted: all-pinned small queue */
 }
 
 static CacheEntry *s3fifo_evict_victim(Cache *cache, CacheSet *set)
@@ -218,7 +236,7 @@ static CacheEntry *s3fifo_evict_victim(Cache *cache, CacheSet *set)
 
     if (way == CACHE_WAY_1) {
         CacheEntry *victim = set->entry;
-        if (!victim) {
+        if (!victim || victim->pinned) {
             return NULL;
         }
         set->entry = NULL;

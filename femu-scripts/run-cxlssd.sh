@@ -20,7 +20,7 @@ fi
 
 # Image directory
 # IMGDIR=$HOME/images
-IMGDIR=/home/liz/images
+IMGDIR=/var/tmp/images
 # Virtual machine disk image
 OSIMGF=$IMGDIR/ubuntu22.qcow2
 
@@ -60,6 +60,10 @@ ssd_size=$1		# in MegaBytes
 # DSE sweep: cache size vs 495MB SIFT1M index (512 = full residency,
 # 256/128/64 = partial -> search-time misses pay NAND latency)
 bufsz=512
+# E3 PQ32: codes region 672MB > 512MB default. Optional launch override:
+# host /tmp/femu-bufsz (MB), e.g. `echo 2048 > /tmp/femu-bufsz` before
+# femu-restart.sh. Remove the file to return to the default.
+if [ -f /tmp/femu-bufsz ]; then bufsz=$(cat /tmp/femu-bufsz); fi
 # bufsz=$((ssd_size/20))
 # skip_ftl=1: guest window accesses bypass the FTL ring/cache and memcpy
 # directly into logical_space (correctness/acceptance mode).

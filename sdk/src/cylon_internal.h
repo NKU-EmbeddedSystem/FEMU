@@ -80,6 +80,7 @@ extern uint32_t gen_ctr, jid;
 extern int g_trace;
 extern uint64_t g_dist, g_hops;
 extern uint64_t g_e_dist, g_e_hops, g_e_pages, g_e_ns;
+extern uint64_t g_e_rerank, g_e_code_pages, g_e_vec_pages;
 extern uint32_t (*g_all_ids)[COLLAB_KMAX];
 extern float (*g_all_d)[COLLAB_KMAX];
 extern uint32_t *g_all_m;

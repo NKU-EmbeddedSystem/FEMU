@@ -14,14 +14,28 @@ static CacheEntry *lifo_evict_victim(Cache *cache, CacheSet *set)
     if (way == CACHE_WAY_1) {
         victim = set->entry;
         if (victim) {
+            if (victim->pinned) {
+                return NULL;
+            }
             set->entry = NULL;
         }
     } else {
-        if (QTAILQ_EMPTY(&set->queue)) {
-            return NULL;
+        uint32_t scanned = 0;
+        uint32_t n = set->count > 0 ? (uint32_t)set->count : 0;
+        while (scanned++ < n) {
+            if (QTAILQ_EMPTY(&set->queue)) {
+                return NULL;
+            }
+            victim = QTAILQ_LAST(&set->queue);
+            QTAILQ_REMOVE(&set->queue, victim, entry);
+            if (!victim->pinned) {
+                return victim;
+            }
+            /* rotate the pinned entry to the head (away from the LIFO
+             * eviction point) and keep scanning, bounded */
+            QTAILQ_INSERT_HEAD(&set->queue, victim, entry);
         }
-        victim = QTAILQ_LAST(&set->queue);
-        QTAILQ_REMOVE(&set->queue, victim, entry);
+        return NULL;
     }
 
     if (!victim) {

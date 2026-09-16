@@ -181,6 +181,20 @@ struct pnm_state {
     uint32_t job_found;
     uint32_t job_staged;         /* STAGE: pages bulk-filled (resp.reserved) */
     uint32_t mb_gen;             /* v2 state word: generation of last accepted job */
+
+    /* CYH2/PQ (AiSAQ): two-stage route state + per-job counters */
+    bool pq;                     /* bound index is CYH2 (PQ route) */
+    uint8_t pq_layout;           /* CYH2_LAYOUT_A1 / CYH2_LAYOUT_A2 */
+    uint32_t pq_m, pq_R;         /* subspaces; default rerank R (header) */
+    uint64_t g_off_codebook, g_off_nodes, g_off_codes;
+    float *codebook;             /* engine-local codebook copy (BIND) */
+    float *lut;                  /* per-query LUT (pq_m x 256 fp32) */
+    uint64_t job_rerank;         /* exact rerank distances this job */
+    uint64_t job_code_pages, job_vec_pages; /* miss split by read class */
+    uint8_t read_class;          /* graph_read attribution: 0=graph 1=code 2=vec */
+    uint32_t a2_memo_id;         /* A2 offset-table single-entry memo */
+    uint64_t a2_memo_off;
+    bool a2_memo_valid;
 };
 
 /* cache-aware translation: hit -> pmem cache slice, miss -> logical_space */
@@ -284,6 +298,11 @@ static void pnm_graph_read(struct pnm_state *st, uint64_t off, void *dst, uint32
                 slot = cylon_cache_lookup_slot(cp->cache_data, lpn);
                 st->job_misses++;
                 st->job_miss_ns += (uint64_t)n->bb_params.pg_rd_lat;
+                if (st->read_class == 1) {
+                    st->job_code_pages++;   /* A1 codes region miss */
+                } else if (st->read_class == 2) {
+                    st->job_vec_pages++;    /* rerank vector miss */
+                }
             }
         }
         memcpy(d,
@@ -304,9 +323,15 @@ static void pnm_unbind(struct pnm_state *st)
     g_free(st->graph);
     g_free(st->visited);
     g_free(st->adj_buf);
+    g_free(st->codebook);
+    g_free(st->lut);
     st->graph = NULL;
     st->visited = NULL;
     st->adj_buf = NULL;
+    st->codebook = NULL;
+    st->lut = NULL;
+    st->pq = false;
+    st->a2_memo_valid = false;
     st->bound = false;
 }
 
@@ -423,6 +448,38 @@ static int pnm_handle_stage(struct pnm_state *st, uint32_t job_id, uint64_t a0)
 
 /* ---------------- job handlers ---------------- */
 
+/* AiSAQ A1: pin the codes region into the device cache. Fill goes through
+ * the normal insert path (policy + EPT + memcpy, same as STAGE); each entry
+ * is then marked pinned so policies skip it as an eviction victim.
+ * Best-effort: an entry evicted in the window between insert and the pin
+ * mark only under-protects (refills unpinned on next touch); no corruption. */
+static void pnm_pin_codes_region(struct pnm_state *st, uint64_t a0)
+{
+    Cxlssd *ctx = st->ctx;
+    FemuCtrl *n = st->n;
+    struct cache_plugin *cp = ctx->cache;
+    Cache *c = (Cache *)cp->cache_data;
+    uint64_t lpn0 = (a0 + st->g_off_codes) >> 12;
+    uint64_t lpn1 = (a0 + st->g_off_codes + (uint64_t)st->count * st->pq_m +
+                     4095) >> 12;
+    uint64_t maxl = ((uint64_t)n->mbe->size >> 12) - DER_TAIL_PIN_PAGES;
+    uint64_t npins = 0;
+
+    if (lpn1 > maxl) {
+        lpn1 = maxl;
+    }
+    for (uint64_t lpn = lpn0; lpn < lpn1; lpn++) {
+        if (cylon_cache_lookup_slot(c, lpn) == UINT32_MAX) {
+            struct cache_entry *e = cp->ops.entry_init(cp->cache_data, lpn);
+            cp->ops.insert(cp->cache_data, e, 0, false);
+        }
+        cylon_cache_pin_entry(c, lpn);
+        npins++;
+    }
+    femu_log("Cylon PNM: A1 codes region pinned (%" PRIu64 " pages, "
+             "%" PRIu64 " MB)\n", npins, npins >> 8);
+}
+
 static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
 {
     Cxlssd *ctx = st->ctx;
@@ -434,7 +491,13 @@ static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
 
     pnm_read(ctx, n, a0, &hdr, sizeof(hdr));
 
-    if (hdr.magic != CYH1_MAGIC || hdr.version != CYH1_VERSION) {
+    bool cyh2 = (hdr.magic == CYH2_MAGIC);
+    if (cyh2) {
+        if (hdr.version != CYH2_VERSION) {
+            femu_log("Cylon PNM: BIND bad CYH2 version %u\n", hdr.version);
+            return PNM_ST_EINVAL;
+        }
+    } else if (hdr.magic != CYH1_MAGIC || hdr.version != CYH1_VERSION) {
         femu_log("Cylon PNM: BIND bad magic/version (0x%08x/%u)\n",
                  hdr.magic, hdr.version);
         return PNM_ST_EINVAL;
@@ -447,7 +510,36 @@ static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
         return PNM_ST_EINVAL;
     }
 
-    blob_sz = hdr.off_levels + hdr.count;   /* levels array is the last section */
+    uint32_t pq_m = 16, layout = 0;
+    if (cyh2) {
+        struct cyh2_header h2;
+        pnm_read(ctx, n, a0, &h2, sizeof(h2));
+        if ((h2.pq_m != 16 && h2.pq_m != 32 && h2.pq_m != 64) ||
+            h2.pq_nbits != 8 ||
+            (h2.layout_flags != CYH2_LAYOUT_A1 &&
+             h2.layout_flags != CYH2_LAYOUT_A2)) {
+            femu_log("Cylon PNM: BIND bad CYH2 geometry (m=%u bits=%u lay=%u)\n",
+                     h2.pq_m, h2.pq_nbits, h2.layout_flags);
+            return PNM_ST_EINVAL;
+        }
+        if (h2.cyh1.dim != hdr.dim || h2.cyh1.count != hdr.count ||
+            !h2.blob_bytes || h2.blob_bytes > win_sz - PNM_MB_OFF_FROM_END) {
+            femu_log("Cylon PNM: BIND bad CYH2 consistency\n");
+            return PNM_ST_EINVAL;
+        }
+        pq_m = h2.pq_m;
+        layout = h2.layout_flags;
+        blob_sz = h2.blob_bytes;
+        st->pq = true;
+        st->pq_layout = (uint8_t)layout;
+        st->pq_m = pq_m;
+        st->pq_R = h2.rerank_R;
+        st->g_off_codebook = h2.off_codebook;
+        st->g_off_nodes = h2.off_nodes;
+        st->g_off_codes = h2.off_codes;
+    } else {
+        blob_sz = hdr.off_levels + hdr.count;   /* levels array is last */
+    }
     if (a0 + blob_sz > win_sz - PNM_MB_OFF_FROM_END) {
         femu_log("Cylon P engine: BIND blob overflows window (blob_end %" PRIu64
                  " > limit %" PRIu64 ")\n", a0 + blob_sz,
@@ -456,6 +548,10 @@ static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
     }
 
     st->local_copy = pnm_use_local_copy(n);
+    if (st->pq && st->local_copy) {
+        femu_log("Cylon PNM: BIND CYH2 requires cache-aware mode\n");
+        return PNM_ST_EINVAL;
+    }
     st->idx_base = a0;      /* window offset of blob start (cache-aware reads) */
 
     /* engine-local copy of the whole blob (read-only, race-free) */
@@ -492,9 +588,26 @@ static int pnm_handle_bind(struct pnm_state *st, uint64_t a0)
     st->visited = g_malloc0((st->count + 7) / 8);
     st->bound = true;
 
-    femu_log("Cylon PNM: index bound (%s search, dim %u count %u maxm0 %u blob %" PRIu64 " MB)\n",
+    /* CYH2: engine-local codebook copy + per-query LUT scratch; A1 pins the
+     * codes region into the cache (AiSAQ: codes are small and resident) */
+    if (st->pq) {
+        st->codebook = g_malloc0((size_t)st->pq_m * 256 * (st->dim / st->pq_m) * sizeof(float));
+        st->lut = g_malloc0((size_t)st->pq_m * 256 * sizeof(float));
+        if (!st->codebook || !st->lut) {
+            pnm_unbind(st);
+            return PNM_ST_ENOMEM;
+        }
+        pnm_read(ctx, n, a0 + st->g_off_codebook, st->codebook,
+                 (uint32_t)(st->pq_m * 256 * (st->dim / st->pq_m) * sizeof(float)));
+        if (st->pq_layout == CYH2_LAYOUT_A1 && ctx->cache) {
+            pnm_pin_codes_region(st, a0);
+        }
+    }
+
+    femu_log("Cylon PNM: index bound (%s search, dim %u count %u maxm0 %u blob %" PRIu64 " MB%s)\n",
              st->local_copy ? "local-copy" : "cache-aware",
-             st->dim, st->count, st->maxm0, blob_sz >> 20);
+             st->dim, st->count, st->maxm0, blob_sz >> 20,
+             st->pq ? (st->pq_layout == CYH2_LAYOUT_A1 ? ", PQ A1" : ", PQ A2") : "");
     return PNM_ST_OK;
 }
 
@@ -525,6 +638,55 @@ static inline float pnm_dist(struct pnm_state *st, uint32_t id)
         acc += diff * diff;
     }
     return acc;
+}
+
+/* AiSAQ (CYH2): A2 node-offset table lookup (u32 record offset relative to
+ * the nodes section start), memoized single-entry. Class 0 (graph). */
+static uint32_t pnm_a2_off(struct pnm_state *st, uint32_t id)
+{
+    if (st->a2_memo_valid && st->a2_memo_id == id) {
+        return st->a2_memo_off;
+    }
+    uint32_t o;
+    pnm_graph_read(st, st->idx_base + st->g_off_nodes + (uint64_t)id * 4,
+                   &o, 4);
+    st->a2_memo_id = id;
+    st->a2_memo_off = o;
+    st->a2_memo_valid = true;
+    return o;
+}
+
+/* PQ ADC distance: pq_m sequential fp32 LUT adds in subspace order over the
+ * 16B code. A1: code from the codes region; A2: code at the node record
+ * start (rides the record page). read_class=1 attributes code misses. */
+static float pnm_adc_dist(struct pnm_state *st, uint32_t id)
+{
+    uint8_t c[64];
+    if (st->pq_layout == CYH2_LAYOUT_A2) {
+        uint32_t roff = pnm_a2_off(st, id);
+        st->read_class = 1;
+        pnm_graph_read(st, st->idx_base + st->g_off_nodes + roff, c,
+                       st->pq_m);
+    } else {
+        st->read_class = 1;
+        pnm_graph_read(st, st->idx_base + st->g_off_codes +
+                            (uint64_t)id * st->pq_m, c, st->pq_m);
+    }
+    st->read_class = 0;
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < st->pq_m; s++) {
+        acc += st->lut[s * 256 + c[s]];
+    }
+    return acc;
+}
+
+/* traversal dispatcher: PQ route scores by ADC; legacy route by exact f16 */
+static inline float pnm_search_dist(struct pnm_state *st, uint32_t id)
+{
+    if (st->pq) {
+        return pnm_adc_dist(st, id);
+    }
+    return pnm_dist(st, id);
 }
 
 /* neighbors at a level: 0 -> adj0 fixed stride; >=1 -> upper records.
@@ -559,6 +721,21 @@ static uint32_t pnm_neighbors(struct pnm_state *st, uint32_t id, int level,
         }
         *ids = (const uint32_t *)(r + 4);
         return *(const uint32_t *)r;
+    }
+
+    /* AiSAQ A2: level-0 adjacency = the node record (codes + deg + ids),
+     * located via the offset table; deg clamped like upper records. */
+    if (st->pq && st->pq_layout == CYH2_LAYOUT_A2 && level == 0) {
+        uint32_t roff = pnm_a2_off(st, id);
+        uint64_t rec = st->idx_base + st->g_off_nodes + roff;
+        uint32_t deg;
+        pnm_graph_read(st, rec + st->pq_m, &deg, 4);
+        if (deg > st->maxm0) {
+            deg = st->maxm0;    /* malformed record: clamp to scratch */
+        }
+        pnm_graph_read(st, rec + 20, st->adj_buf, deg * 4);
+        *ids = (const uint32_t *)st->adj_buf;
+        return deg;
     }
 
     /* cache-aware: pull the record through the cache hierarchy */
@@ -656,14 +833,36 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
         }
     }
 
+    /* per-query LUT build (PQ mode): LUT[s][c] = sum over subspace s of
+     * (q - centroid)^2, fp32 — same arithmetic as aisaq_ref_search.c.
+     * (The build loop was missing: LUT stayed all-zero, every ADC distance
+     * read 0.0, and level-0 ranking collapsed to walk order — recall 0.05.) */
+    if (st->pq) {
+        uint32_t ds = st->dim / st->pq_m;
+        for (uint32_t s = 0; s < st->pq_m; s++) {
+            const float *qs = st->qconv + s * ds;
+            for (uint32_t c = 0; c < 256; c++) {
+                float acc = 0.0f;
+                const float *cs = st->codebook + ((size_t)s * 256 + c) * ds;
+                for (uint32_t i = 0; i < ds; i++) {
+                    float diff = qs[i] - cs[i];
+                    acc += diff * diff;
+                }
+                st->lut[s * 256 + c] = acc;
+            }
+        }
+    }
+
     uint64_t n_dist = 1, n_hops = 0;    /* entry-point distance counted */
     st->job_misses = 0;
     st->job_miss_ns = 0;
     uint64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     /* greedy descent through upper levels (entry -> level 1) */
+    /* descent scores with the search dist (ADC in PQ mode) — the ref
+     * searcher descends by adc_dist; byte-gate requires the same walk */
     uint32_t cur = st->entry_point;
-    float cur_d = pnm_dist(st, cur);
+    float cur_d = pnm_search_dist(st, cur);
     for (int l = st->entry_level; l >= 1; l--) {
         bool improved = true;
         while (improved) {
@@ -673,7 +872,7 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
             n_hops++;
             for (uint32_t j = 0; j < degree; j++) {
                 uint32_t nb = ids[j];
-                float d = pnm_dist(st, nb);
+                float d = pnm_search_dist(st, nb);
                 n_dist++;
                 if (d < cur_d) {
                     cur_d = d;
@@ -700,10 +899,45 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
         n_hops++;
         for (uint32_t j = 0; j < degree; j++) {
             uint32_t nb = ids[j];
-            float d = pnm_dist(st, nb);
+            float d = pnm_search_dist(st, nb);
             n_dist++;
             pnm_visit(st, &cand_n, &res_n, nb, d, ef);
         }
+    }
+
+    /* AiSAQ rerank (PQ route only): exact full-precision L2 over the top-R
+     * of the ADC-sorted res heap. pnm_dist re-reads vectors (read_class=2
+     * attributes those misses to the vector region); rerank distances
+     * REPLACE the ADC scores, then the prefix is re-sorted. R = knob
+     * /tmp/femu-rerank-R (override) or the header default; clamped to
+     * [k, res_n]. */
+    if (st->pq) {
+        qsort(st->res, res_n, sizeof(struct pnm_cnd), pnm_cmp_asc);
+        uint32_t R = st->pq_R;
+        FILE *rf = fopen("/tmp/femu-rerank-R", "r");
+        if (rf) {
+            char rb[32] = { 0 };
+            if (fgets(rb, sizeof(rb), rf)) {
+                uint32_t rv = (uint32_t)strtoull(rb, 0, 0);
+                if (rv) {
+                    R = rv;
+                }
+            }
+            fclose(rf);
+        }
+        if (!R || R > res_n) {
+            R = res_n;
+        }
+        if (R < k && res_n >= k) {
+            R = k;
+        }
+        st->read_class = 2;
+        for (uint32_t i = 0; i < R; i++) {
+            st->res[i].d = pnm_dist(st, st->res[i].id);
+        }
+        st->read_class = 0;
+        st->job_rerank = R;
+        qsort(st->res, R, sizeof(struct pnm_cnd), pnm_cmp_asc);
     }
 
     /* modeled device compute capability: the PNM dist array charges
@@ -724,7 +958,32 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
         }
         fclose(cf);
     }
-    if (comp_ns) {
+    if (st->pq) {
+        /* AiSAQ two-stage billing: ADC routing compute (n_dist x adc-ns)
+         * and rerank compute (job_rerank x compute-ns), each live-knobbed;
+         * the A0 semantic (n_dist x compute-ns) is untouched. */
+        uint64_t adc_ns = 0;
+        FILE *af = fopen("/tmp/femu-adc-ns", "r");
+        if (af) {
+            char ab[32] = { 0 };
+            if (fgets(ab, sizeof(ab), af)) {
+                adc_ns = strtoull(ab, 0, 0);
+            }
+            fclose(af);
+        }
+        if (adc_ns) {
+            uint64_t ctarget = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                               n_dist * adc_ns;
+            while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < ctarget) {
+            }
+        }
+        if (comp_ns) {
+            uint64_t ctarget = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                               st->job_rerank * comp_ns;
+            while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < ctarget) {
+            }
+        }
+    } else if (comp_ns) {
         uint64_t ctarget = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                            n_dist * comp_ns;
         while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < ctarget) {
@@ -749,7 +1008,9 @@ static int pnm_handle_search(struct pnm_state *st, uint32_t job_id,
 
     /* top-k: sort ascending by distance, emit k entries {u32 id, f32 dist} */
     uint32_t m = res_n < k ? res_n : k;
-    qsort(st->res, res_n, sizeof(struct pnm_cnd), pnm_cmp_asc);
+    if (!st->pq) {
+        qsort(st->res, res_n, sizeof(struct pnm_cnd), pnm_cmp_asc);
+    }
     for (uint32_t i = 0; i < k; i++) {
         uint32_t id = i < m ? st->res[i].id : 0xffffffffu;
         float d = i < m ? st->res[i].d : 0.0f;
@@ -840,6 +1101,10 @@ static void *pnm_thread_fn(void *opaque)
         st->job_dist = 0;
         st->job_hops = 0;
         st->job_pages = 0;
+        st->job_rerank = 0;
+        st->job_code_pages = 0;
+        st->job_vec_pages = 0;
+        st->read_class = 0;
 
         /* D3 Device-Atomic transport bill (live knob /tmp/femu-atomic-ns,
          * absent/0 = off -- comp_dly knob family): charged once per accepted
@@ -902,6 +1167,9 @@ static void *pnm_thread_fn(void *opaque)
         mb.resp.n_dist = st->job_dist;
         mb.resp.n_hops = st->job_hops;
         mb.resp.n_pages = st->job_pages;
+        mb.resp.n_rerank = st->job_rerank;
+        mb.resp.n_code_pages = st->job_code_pages;
+        mb.resp.n_vector_pages = st->job_vec_pages;
 
         pnm_write(ctx, n, mb_off + offsetof(struct pnm_mb_s, resp),
                   &mb.resp, sizeof(mb.resp));

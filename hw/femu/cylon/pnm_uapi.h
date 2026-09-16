@@ -77,7 +77,7 @@ struct pnm_job_s {
     uint64_t reserved1[2];
 };
 
-/* engine response (40B) */
+/* engine response (64B: legacy 40B prefix, PQ extras appended) */
 struct pnm_resp_s {
     uint32_t job_id;
     uint32_t status;      /* PNM_ST_* */
@@ -87,6 +87,10 @@ struct pnm_resp_s {
     uint64_t n_dist;      /* distance computations */
     uint64_t n_hops;      /* neighbor-list expansions */
     uint64_t n_pages;     /* search-time cache misses (NAND page reads charged) */
+    /* --- CYH2/PQ route extras (uapi v2; appended, legacy offsets kept) --- */
+    uint64_t n_rerank;       /* full-precision rerank distances (0 = A0) */
+    uint64_t n_code_pages;   /* code-region page misses (A1 codes region) */
+    uint64_t n_vector_pages; /* vector-region page misses (rerank pulls) */
 };
 
 /* mailbox (one outstanding job; v2 state word packs status+gen as u64) */
@@ -120,4 +124,23 @@ struct cyh1_header {
     uint64_t off_levels;
 };
 
+/* CYH2: AiSAQ-style PQ index container (branch cylon-v9.2-aisaq).
+ * Header = the CYH1 prefix (legacy offsets remain valid per layout) + PQ
+ * extension. A1 = CYH1 sections byte-identical + [codebook][codes] appended
+ * after levels; A2 = vectors | upper | levels | codebook | node records
+ * ([16B code | u32 deg | deg*u32 ids], offset table first, offsets relative
+ * to section start; off_adj0 = 0).
+ * rerank_R is the engine default; /tmp/femu-rerank-R overrides per job. */
+#define CYH2_MAGIC   0x32485943  /* "CYH2" */
+#define CYH2_VERSION 1
+#define CYH2_LAYOUT_A1 1
+#define CYH2_LAYOUT_A2 2
+struct cyh2_header {
+    struct cyh1_header cyh1;                 /* 64B legacy prefix */
+    uint64_t off_codebook;
+    uint64_t off_nodes;
+    uint64_t off_codes;
+    uint32_t pq_m, pq_nbits, rerank_R, layout_flags;
+    uint64_t blob_bytes;
+};
 #endif

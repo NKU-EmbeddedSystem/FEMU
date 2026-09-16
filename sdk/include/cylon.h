@@ -79,6 +79,8 @@ typedef struct {
  * post-update value; fixed mode: cfg cpu_frac). */
 typedef struct {
     uint64_t n_dist, n_hops, n_pages, engine_ns;
+    /* uapi v2 (CYH2/PQ): routing/rerank split, 0 on the legacy A0 route */
+    uint64_t n_rerank, n_code_pages, n_vector_pages;
     float    f_cur;
 } cylon_stats;
 

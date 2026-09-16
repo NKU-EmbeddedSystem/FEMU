@@ -13,14 +13,29 @@ static CacheEntry *fifo_evict_victim(Cache *cache, CacheSet *set)
     if (way == CACHE_WAY_1) {
         victim = set->entry;
         if (victim) {
+            if (victim->pinned) {
+                return NULL;    /* only entry is pinned: nothing evictable */
+            }
             set->entry = NULL;
         }
     } else {
-        if (QTAILQ_EMPTY(&set->queue)) {
-            return NULL;
+        /* FIFO order, but pinned entries rotate to the tail and are
+         * reconsidered only after every unpinned entry (bounded: an
+         * all-pinned set has no victim) */
+        uint32_t scanned = 0;
+        uint32_t n = set->count > 0 ? (uint32_t)set->count : 0;
+        while (scanned++ < n) {
+            if (QTAILQ_EMPTY(&set->queue)) {
+                return NULL;
+            }
+            victim = QTAILQ_FIRST(&set->queue);
+            QTAILQ_REMOVE(&set->queue, victim, entry);
+            if (!victim->pinned) {
+                return victim;
+            }
+            QTAILQ_INSERT_TAIL(&set->queue, victim, entry);
         }
-        victim = QTAILQ_FIRST(&set->queue);
-        QTAILQ_REMOVE(&set->queue, victim, entry);
+        return NULL;
     }
 
     if (!victim) {

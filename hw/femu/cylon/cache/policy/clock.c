@@ -74,13 +74,23 @@ static CacheEntry *clock_evict_victim(Cache *cache, CacheSet *set)
     }
 
     CacheEntry *ent = clock_hand(set);
+    uint32_t scanned = 0;
+    uint32_t n = set->count > 0 ? (uint32_t)set->count : 0;
 
-    while (1) {
+    while (scanned++ < (n + 1) * 2) {
         if (!ent) {
             ent = QTAILQ_FIRST(&set->queue);
             if (!ent) {
                 return NULL;
             }
+        }
+
+        if (ent->pinned) {
+            /* skip without clearing the ref bit; bounded scan: an
+             * all-pinned set has no victim */
+            ent = clock_next(set, ent);
+            clock_set_hand(set, ent);
+            continue;
         }
 
         if (clock_get_ref(ent->policy_data) == 0) {
@@ -100,6 +110,7 @@ static CacheEntry *clock_evict_victim(Cache *cache, CacheSet *set)
             clock_set_hand(set, ent);
         }
     }
+    return NULL;    /* bounded scan exhausted: all-pinned set */
 }
 
 static int clock_insert_entry(Cache *cache, CacheEntry *entry)

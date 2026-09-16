@@ -161,7 +161,10 @@ int main(int argc, char **argv)
     /* stage blob + queries exactly like pnm_client */
     if (!skip_stage && !stage_dev) blob_bytes = stage_file(blob, 0);
     struct cyh1_header *hdr = (struct cyh1_header *)win;
-    if (hdr->magic != CYH1_MAGIC) {
+    /* CYH2 (A1 layout): cyh1 64B prefix is field-identical for the graph
+     * part; the engine BIND consumes the PQ tail. Client only needs the
+     * prefix, so accept both magics. */
+    if (hdr->magic != CYH1_MAGIC && hdr->magic != CYH2_MAGIC) {
         fprintf(stderr, "cpu_search: bad CYH1 magic %08x\n", hdr->magic);
         return 1;
     }
@@ -282,6 +285,10 @@ int main(int argc, char **argv)
                 }
             }
         }
+        if (dfp) {
+            /* flush the dump BEFORE the tail (verify_window can run long) */
+            fflush(dfp);
+        }
         if (n) {
             printf("pass%d query 0 top-10:", pass);
             for (uint32_t i = 0; i < 10 && i < g_all_m[0]; i++) {
@@ -325,9 +332,19 @@ int main(int argc, char **argv)
             printf("engine/query: dist %.1f  hops %.1f  exec %.0f ns  misses %.1f\n",
                    (double)g_e_dist / n_eng, (double)g_e_hops / n_eng,
                    (double)g_e_ns / n_eng, (double)g_e_pages / n_eng);
+            if (g_e_rerank || g_e_code_pages || g_e_vec_pages) {
+                printf("engine/query: rerank %.1f  code-pages %.1f  "
+                       "vec-pages %.1f  (PQ route)\n",
+                       (double)g_e_rerank / n_eng,
+                       (double)g_e_code_pages / n_eng,
+                       (double)g_e_vec_pages / n_eng);
+            }
         }
         printf("recall@%u  = %.4f\n", k, (double)hits / tot);
-        (void)verify_window(blob);
+        /* 36GB trap-fest by default; CYLON_NO_VERIFY=1 skips it */
+        if (!getenv("CYLON_NO_VERIFY")) {
+            (void)verify_window(blob);
+        }
     }
     if (dfp) {
         fclose(dfp);

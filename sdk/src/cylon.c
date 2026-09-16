@@ -590,6 +590,7 @@ uint32_t *g_all_m;            /* #valid entries per query */
 
 /* engine-side accumulators (feeder thread only) */
 uint64_t g_e_dist, g_e_hops, g_e_pages, g_e_ns;
+uint64_t g_e_rerank, g_e_code_pages, g_e_vec_pages;
 
 
 /* CPU worker: the existing local traversal over queries [0, n_cpu). The
@@ -674,6 +675,9 @@ int engine_feeder(uint64_t qoff, uint32_t n, uint32_t n_cpu,
         g_e_hops += r.n_hops;
         g_e_pages += r.n_pages;
         g_e_ns += r.total_ns;
+        g_e_rerank += r.n_rerank;
+        g_e_code_pages += r.n_code_pages;
+        g_e_vec_pages += r.n_vector_pages;
     }
     return 0;
 }
