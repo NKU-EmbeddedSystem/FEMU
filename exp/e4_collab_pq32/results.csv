@@ -1,0 +1,9 @@
+arm,n,f,cxl_ns,mlp,p50_ms,exec_ms,recall,dump_md5,note
+P1_gate_n100,100,1.0,0,1,288.9,2976.1,0.9630,5948a743748338917891ac75dca45d4b,P1 client PQ port gate PASS
+C1_pure_cpu_window,1000,1.0,0,1,299.2,3003.2,0.9458,d8986bceca1755465b2119b422ed9b07,B3 baseline; no BIND so codes unpinned
+cpu_c0,1000,1.0,0,1,297.5,3003.2,0.9458,d8986bceca1755465b2119b422ed9b07,unbilled baseline (repeat of C1)
+cpu_c300,1000,1.0,300,1,327.3,3294.1,0.9458,d8986bceca1755465b2119b422ed9b07,model charge 28.6ms
+cpu_c1000,1000,1.0,1000,1,393.3,3961.9,0.9458,d8986bceca1755465b2119b422ed9b07,model charge 95.5ms
+cpu_c3000,1000,1.0,3000,1,586.4,5878.4,0.9458,d8986bceca1755465b2119b422ed9b07,model charge 286.5ms
+cpu_c3000_m8,1000,1.0,3000,8,336.1,3381.7,0.9458,d8986bceca1755465b2119b422ed9b07,model charge 35.8ms; 8-way overlap
+eng_f0,1000,0.0,0,1,278.7,2765.8,0.9458,d8986bceca1755465b2119b422ed9b07,device executes; no link bill; misses 4425.1 code-pages 0.0
