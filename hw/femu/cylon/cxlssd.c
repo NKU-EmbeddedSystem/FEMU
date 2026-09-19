@@ -402,6 +402,26 @@ static void cylon_bi_charge(uint64_t addr, unsigned size)
     }
 }
 
+/* F2 diagnostics (2026-09-18): the 2026-09-14 host OOM (qemu anon-rss
+ * 124GB during a 9.4M-page window walk) has no local repro. Log the process
+ * RSS every CYLON_RSS_EVERY faults/traps so a long walk yields a growth
+ * curve -- leak-per-access vs a one-shot jump -- instead of a guess. */
+static void cylon_rss_probe(const char *tag, uint64_t n)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) {
+        return;
+    }
+    unsigned long vsz = 0, rss = 0;
+    if (fscanf(f, "%lu %lu", &vsz, &rss) == 2) {
+        fprintf(stderr, "Cylon RSS: %s n=%llu vm=%lu MB rss=%lu MB\n", tag,
+                (unsigned long long)n, vsz * 4 / 1024, rss * 4 / 1024);
+    }
+    fclose(f);
+}
+
+#define CYLON_RSS_EVERY 65536ull
+
 /* Singleton for the KVM_EXIT_CYLON_DER handler (kvm-all.c calls in without
  * a device handle; single CXL-SSD window per VM). Captured at realize. */
 static FemuCtrl *cylon_der_fault_ctrl;
@@ -427,6 +447,17 @@ int cylon_der_handle_fault(uint64_t gpa, uint8_t is_write)
     Cxlssd *ctx;
     DerKvmState *s;
     uint64_t addr;
+
+    /* F2 diagnostics: this (KVM_EXIT_CYLON_DER, D3-F F5) is the REAL
+     * per-access entry; cxlssd_mem_read/write is the legacy emulator
+     * fallback and stays near-silent. Log RSS every 65536 faults so a long
+     * walk yields the growth curve. */
+    {
+        static uint64_t nfault;
+        if ((++nfault % CYLON_RSS_EVERY) == 0) {
+            cylon_rss_probe(is_write ? "der-fault-w" : "der-fault-r", nfault);
+        }
+    }
 
     if (!n || !n->mbe) {
         return -1;
@@ -462,6 +493,12 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     FemuCtrl *n = (FemuCtrl *)opaque;
     assert(addr < n->mbe->size);
     {
+        static uint64_t ntrap;
+        if ((++ntrap % CYLON_RSS_EVERY) == 0) {
+            cylon_rss_probe("read-trap", ntrap);
+        }
+    }
+    {
         static unsigned dbg_n;
         if (femu_cxldbg_on() && dbg_n < 64) {
             dbg_n++;
@@ -492,6 +529,12 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 {
     FemuCtrl *n = (FemuCtrl *)opaque;
     assert(addr < n->mbe->size);
+    {
+        static uint64_t ntrap;
+        if ((++ntrap % CYLON_RSS_EVERY) == 0) {
+            cylon_rss_probe("write-trap", ntrap);
+        }
+    }
     {
         static unsigned dbg_n;
         if (femu_cxldbg_on() && dbg_n < 64) {
