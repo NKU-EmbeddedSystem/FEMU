@@ -35,6 +35,15 @@ int main(int argc, char **argv)
             g_poll_us = strchr(argv[i], '=')
                         ? strtoul(strchr(argv[i], '=') + 1, 0, 0) : 50;
         }
+        else if (!strncmp(argv[i], "--cxl-access-ns=", 16)) {
+            g_cxl_access_ns = strtoull(argv[i] + 16, 0, 0);
+        }
+        else if (!strncmp(argv[i], "--cxl-mlp=", 10)) {
+            g_cxl_mlp = (uint32_t)strtoul(argv[i] + 10, 0, 0);
+            if (!g_cxl_mlp) {
+                g_cxl_mlp = 1;
+            }
+        }
         else if (!strncmp(argv[i], "--notify=", 9)) {
             const char *v = argv[i] + 9;
             if (!strcmp(v, "poll")) {
@@ -176,6 +185,37 @@ int main(int argc, char **argv)
     st.g_off_adj0 = hdr->off_adj0;
     st.g_off_upper = hdr->off_upper;
     st.g_off_levels = hdr->off_levels;
+
+    /* CYH2 tail: PQ route (A1 layout only — the client has no A2 record
+     * reader). Same geometry check as the engine BIND. */
+    st.pq = 0;
+    st.codebook = NULL;
+    st.lut = NULL;
+    if (hdr->magic == CYH2_MAGIC) {
+        struct cyh2_header *h2 = (struct cyh2_header *)win;
+        if ((h2->pq_m != 16 && h2->pq_m != 32 && h2->pq_m != 64) ||
+            h2->pq_nbits != 8 || h2->layout_flags != CYH2_LAYOUT_A1) {
+            fprintf(stderr, "cpu_search: unsupported CYH2 geometry "
+                    "(pq_m %u nbits %u layout %u)\n",
+                    h2->pq_m, h2->pq_nbits, h2->layout_flags);
+            return 1;
+        }
+        st.pq = 1;
+        st.pq_m = h2->pq_m;
+        st.pq_R = h2->rerank_R;
+        st.g_off_codebook = h2->off_codebook;
+        st.g_off_codes = h2->off_codes;
+        st.g_off_nodes = h2->off_nodes;
+        st.codebook = (float *)(win + h2->off_codebook);
+        st.lut = malloc(sizeof(float) * (size_t)st.pq_m * 256);
+        if (!st.lut) {
+            fprintf(stderr, "cpu_search: lut alloc\n");
+            return 1;
+        }
+        printf("client PQ route: pq_m %u rerank_R %u codes@0x%lx codebook@0x%lx\n",
+               st.pq_m, st.pq_R, (unsigned long)st.g_off_codes,
+               (unsigned long)st.g_off_codebook);
+    }
 
     uint64_t qoff = (blob_bytes + 4095) & ~4095ull;
     win_blob_bytes = blob_bytes;
@@ -326,6 +366,13 @@ int main(int argc, char **argv)
                    "(misses not visible client-side; ~exec/40us when miss-bound)\n",
                    (double)g_dist / n_cpu, (double)g_hops / n_cpu,
                    (double)cpu_sum / n_cpu);
+            if (g_cxl_access_ns) {
+                printf("cxl/query: accesses %.1f  charge %.1f ms "
+                       "(knob %llu ns/access, mlp %u; engine arm unbilled)\n",
+                       (double)g_cxl_accesses / n_cpu,
+                       (double)g_cxl_charge_ns / n_cpu / 1e6,
+                       (unsigned long long)g_cxl_access_ns, g_cxl_mlp);
+            }
         }
         if (n_cpu < n) {
             uint32_t n_eng = n - n_cpu;
@@ -341,8 +388,12 @@ int main(int argc, char **argv)
             }
         }
         printf("recall@%u  = %.4f\n", k, (double)hits / tot);
-        /* 36GB trap-fest by default; CYLON_NO_VERIFY=1 skips it */
-        if (!getenv("CYLON_NO_VERIFY")) {
+        /* Window-walk audit: 9.4M traps over 38.5GB -- measured at 35min
+         * (E2) to 12h+ (E3 1GB arm, which OOM-killed the host at 124GB
+         * qemu anon-rss). Skipped by default: the dump md5 gate is the
+         * real verification and the walk adds no information to it.
+         * Opt in with CYLON_VERIFY=1 for a window data audit. */
+        if (getenv("CYLON_VERIFY")) {
             (void)verify_window(blob);
         }
     }

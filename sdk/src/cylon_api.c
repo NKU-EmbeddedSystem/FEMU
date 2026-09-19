@@ -297,11 +297,38 @@ cylon_status cylon_load(cylon_ctx *ctx)
     st.g_off_upper = hdr->off_upper;
     st.g_off_levels = hdr->off_levels;
 
+    /* CYH2 tail: PQ route (A1 layout only — no A2 record reader client-side) */
+    st.pq = 0;
+    st.codebook = NULL;
+    st.lut = NULL;
+    if (hdr->magic == CYH2_MAGIC) {
+        struct cyh2_header *h2 = (struct cyh2_header *)win;
+        if ((h2->pq_m != 16 && h2->pq_m != 32 && h2->pq_m != 64) ||
+            h2->pq_nbits != 8 || h2->layout_flags != CYH2_LAYOUT_A1) {
+            fprintf(stderr, "cylon: unsupported CYH2 geometry "
+                    "(pq_m %u nbits %u layout %u)\n",
+                    h2->pq_m, h2->pq_nbits, h2->layout_flags);
+            return CYLON_ST_EINVAL;
+        }
+        st.pq = 1;
+        st.pq_m = h2->pq_m;
+        st.pq_R = h2->rerank_R;
+        st.g_off_codebook = h2->off_codebook;
+        st.g_off_codes = h2->off_codes;
+        st.g_off_nodes = h2->off_nodes;
+        st.codebook = (float *)(win + h2->off_codebook);
+        st.lut = malloc(sizeof(float) * (size_t)st.pq_m * 256);
+        if (!st.lut) {
+            return CYLON_ST_EINVAL;
+        }
+    }
+
     /* re-load() after a prior load: drop the previous traversal state */
     free(st.visited);   st.visited = NULL;
     free(st.cand);      st.cand = NULL;
     free(st.res);       st.res = NULL;
     free(st.qconv);     st.qconv = NULL;
+    free(st.lut);       st.lut = NULL;
 
     st.visited = calloc(1, (st.count + 7) / 8);
     st.cand_cap = 65536; st.res_cap = 4096;

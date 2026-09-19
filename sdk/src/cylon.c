@@ -175,6 +175,54 @@ static inline float pnm_dist(uint32_t id)
     return acc;
 }
 
+/* --- CYH2 PQ route: mirrors pnm.c's pnm_adc_dist / pnm_search_dist ---
+ * ADC distance = pq_m LUT adds over the code bytes (A1: codes region at
+ * g_off_codes + id*pq_m). The client has no A2 record reader, so A2 blobs
+ * are refused at load (see cylon_api/cpu_search header parse). */
+static inline float pnm_adc_dist(uint32_t id)
+{
+    const uint8_t *c = st.graph + st.g_off_codes + (uint64_t)id * st.pq_m;
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < st.pq_m; s++) {
+        acc += st.lut[s * 256 + c[s]];
+    }
+    return acc;
+}
+
+static inline float pnm_search_dist(uint32_t id)
+{
+    if (st.pq) {
+        return pnm_adc_dist(id);
+    }
+    return pnm_dist(id);
+}
+
+/* --- E4-B1: modeled CXL per-access link cost for guest-origin reads -----
+ * The DER model charges only fills (NAND latency); a real CXL host pays the
+ * link round trip on EVERY window access (the device's DRAM cache saves NAND
+ * latency, not link latency). Knobs: --cxl-access-ns=N (0 = off = today's
+ * behavior) and --cxl-mlp=M (outstanding-access overlap: charge N/M).
+ * Pure busy-wait -> data path untouched -> dumps stay byte-identical. */
+uint64_t g_cxl_access_ns;      /* ns per access, 0 = off */
+uint32_t g_cxl_mlp = 1;        /* access-level parallelism divisor */
+uint64_t g_cxl_accesses;       /* accumulated access count */
+uint64_t g_cxl_charge_ns;      /* accumulated modeled ns */
+
+static inline void cxl_bill(uint64_t n_access)
+{
+    if (!g_cxl_access_ns || !n_access) {
+        return;
+    }
+    uint64_t ns = n_access * g_cxl_access_ns /
+                  (g_cxl_mlp ? g_cxl_mlp : 1);
+    uint64_t target = now_ns() + ns;
+    while (now_ns() < target) {
+        /* spin: modeled link time */
+    }
+    g_cxl_accesses += n_access;
+    g_cxl_charge_ns += ns;
+}
+
 static uint32_t pnm_neighbors(uint32_t id, int level, const uint32_t **ids)
 {
     if (level == 0) {
@@ -243,9 +291,27 @@ static uint32_t pnm_search(const uint16_t *qh, uint32_t k, uint32_t ef,
         st.qconv[i] = pnm_f16_to_f32(qh[i]);
     }
 
+    /* per-query LUT build (PQ route): LUT[s][c] = sum over subspace s of
+     * (q - centroid)^2, fp32 — same arithmetic as pnm.c / aisaq_ref_search */
+    if (st.pq) {
+        uint32_t ds = st.dim / st.pq_m;
+        for (uint32_t s = 0; s < st.pq_m; s++) {
+            const float *qs = st.qconv + (size_t)s * ds;
+            for (uint32_t c = 0; c < 256; c++) {
+                float acc = 0.0f;
+                const float *cs = st.codebook + ((size_t)s * 256 + c) * ds;
+                for (uint32_t i = 0; i < ds; i++) {
+                    float diff = qs[i] - cs[i];
+                    acc += diff * diff;
+                }
+                st.lut[s * 256 + c] = acc;
+            }
+        }
+    }
+
     uint64_t n_dist = 1, n_hops = 0;
     uint32_t cur = st.entry_point;
-    float cur_d = pnm_dist(cur);
+    float cur_d = pnm_search_dist(cur);
     if (g_trace) printf("TRACE entry cur=%u d=%.1f lvl=%u\n", cur, cur_d, st.entry_level);
     for (int l = st.entry_level; l >= 1; l--) {
         bool improved = true;
@@ -258,7 +324,7 @@ static uint32_t pnm_search(const uint16_t *qh, uint32_t k, uint32_t ef,
                                l, (unsigned long long)n_hops, cur, cur_d, degree);
             for (uint32_t j = 0; j < degree; j++) {
                 uint32_t nb = ids[j];
-                float d = pnm_dist(nb);
+                float d = pnm_search_dist(nb);
                 n_dist++;
                 if (d < cur_d) {
                     cur_d = d;
@@ -286,13 +352,40 @@ static uint32_t pnm_search(const uint16_t *qh, uint32_t k, uint32_t ef,
         n_hops++;
         for (uint32_t j = 0; j < degree; j++) {
             uint32_t nb = ids[j];
-            float d = pnm_dist(nb);
+            float d = pnm_search_dist(nb);
             n_dist++;
             pnm_visit(&cand_n, &res_n, nb, d, ef);
         }
     }
     g_dist += n_dist;
     g_hops += n_hops;
+
+    /* AiSAQ rerank (PQ route only): exact full-precision L2 over the top-R
+     * of the ADC-sorted res heap; rerank distances REPLACE the ADC scores
+     * and the prefix is re-sorted. Mirrors pnm.c (R = header default; the
+     * /tmp/femu-rerank-R knob is host-side and not visible to the client). */
+    uint32_t rerank_n = 0;
+    if (st.pq) {
+        qsort(st.res, res_n, sizeof(struct pnm_cnd), pnm_cnd_asc);
+        uint32_t R = st.pq_R;
+        if (!R || R > res_n) {
+            R = res_n;
+        }
+        if (R < k && res_n >= k) {
+            R = k;
+        }
+        for (uint32_t i = 0; i < R; i++) {
+            st.res[i].d = pnm_dist(st.res[i].id);
+        }
+        qsort(st.res, R, sizeof(struct pnm_cnd), pnm_cnd_asc);
+        rerank_n = R;
+    }
+
+    /* E4-B1: guest-origin window accesses this query = code reads (n_dist)
+     * + adjacency reads (n_hops) + rerank vector reads (R). Engine-processed
+     * queries never come through here -- in-device accesses cross no link,
+     * which is exactly the asymmetry this knob exists to quantify. */
+    cxl_bill(n_dist + n_hops + rerank_n);
 
     uint32_t m = res_n < k ? res_n : k;
     qsort(st.res, res_n, sizeof(struct pnm_cnd), pnm_cnd_asc);

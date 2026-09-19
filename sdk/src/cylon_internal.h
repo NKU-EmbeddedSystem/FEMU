@@ -51,6 +51,13 @@ struct cylon_st {
     struct pnm_cnd *res;
     uint32_t cand_cap, res_cap;
     float *qconv;
+    /* CYH2 PQ route (A1 layout): ADC codes region + codebook + LUT scratch.
+     * codebook points INTO the window (no copy: same arithmetic as pnm.c). */
+    uint32_t pq;                 /* 1 = CYH2 (PQ route), 0 = legacy CYH1 */
+    uint32_t pq_m, pq_R;         /* subspaces; header default rerank R */
+    uint64_t g_off_codebook, g_off_codes, g_off_nodes;
+    float *codebook;
+    float *lut;                  /* pq_m x 256 fp32, per query */
 };
 
 
@@ -81,6 +88,9 @@ extern int g_trace;
 extern uint64_t g_dist, g_hops;
 extern uint64_t g_e_dist, g_e_hops, g_e_pages, g_e_ns;
 extern uint64_t g_e_rerank, g_e_code_pages, g_e_vec_pages;
+/* E4-B1 modeled CXL per-access link cost (guest-origin reads) */
+extern uint64_t g_cxl_access_ns, g_cxl_accesses, g_cxl_charge_ns;
+extern uint32_t g_cxl_mlp;
 extern uint32_t (*g_all_ids)[COLLAB_KMAX];
 extern float (*g_all_d)[COLLAB_KMAX];
 extern uint32_t *g_all_m;
